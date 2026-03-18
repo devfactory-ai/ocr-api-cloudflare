@@ -1,0 +1,18 @@
+{
+  "name": "ocr-api-cloudflare",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.79.0",
+    "@google/generative-ai": "^0.24.1",
+    "hono": "^4.12.8"
+  }
+}

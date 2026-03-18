@@ -1,0 +1,6 @@
+name = "ocr-api-bh-assurance"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+[vars]
+GEMINI_API_KEY = "AIzaSyB6O8Di2QI43BuGwpfua5FqWJtZJBnwp2E"
