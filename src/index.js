@@ -294,6 +294,73 @@ app.get("/openapi.json", (c) => {
           },
         },
       },
+      "/valider-bulletin": {
+        post: {
+          summary: "Valider/corriger un bulletin extrait",
+          description: "Reçoit les données corrigées par l'utilisateur avec metadata de validation (boucle de feedback)",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    donnees_ia: { type: "object", description: "Les données extraites, éventuellement corrigées par l'utilisateur" },
+                    metadata_validation: {
+                      type: "object",
+                      properties: {
+                        statut_validation: { type: "string", description: "Statut: en_attente, valide, corrige, rejete" },
+                        erreurs_signalees: { type: "array", items: { type: "string" }, description: "Liste des erreurs signalées" },
+                        commentaires_correction: { type: "string", description: "Commentaires de correction" },
+                      },
+                      required: ["statut_validation"],
+                    },
+                  },
+                  required: ["donnees_ia", "metadata_validation"],
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: "Feedback enregistré",
+              content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" }, message: { type: "string" }, statut: { type: "string" } } } } },
+            },
+            422: {
+              description: "Données manquantes",
+              content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" }, erreur: { type: "string" } } } } },
+            },
+          },
+        },
+      },
+      "/bulletins": {
+        get: {
+          summary: "Lister les bulletins validés",
+          description: "Retourne tous les bulletins validés/corrigés stockés en base",
+          responses: {
+            200: {
+              description: "Liste des bulletins",
+              content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" }, total: { type: "integer" }, bulletins: { type: "array", items: { type: "object" } } } } } },
+            },
+          },
+        },
+      },
+      "/bulletins/{id}": {
+        get: {
+          summary: "Récupérer un bulletin par ID",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "integer" } }],
+          responses: {
+            200: {
+              description: "Bulletin trouvé",
+              content: { "application/json": { schema: { type: "object" } } },
+            },
+            404: {
+              description: "Bulletin non trouvé",
+              content: { "application/json": { schema: { type: "object", properties: { success: { type: "boolean" }, erreur: { type: "string" } } } } },
+            },
+          },
+        },
+      },
       "/ocr": {
         post: {
           summary: "OCR simple",
@@ -379,17 +446,139 @@ app.post("/analyse-bulletin", async (c) => {
       return c.json({
         success: true,
         nombre_fichiers: files.length,
-        resultat: data,
+        donnees_ia: data,
+        metadata_validation: {
+          statut_validation: "en_attente",
+          erreurs_signalees: [],
+          commentaires_correction: "",
+        },
       });
     } catch {
       return c.json({
         success: true,
         nombre_fichiers: files.length,
-        resultat: null,
+        donnees_ia: null,
         reponse_brute: text,
         avertissement: "La réponse n'a pas pu être parsée en JSON structuré.",
+        metadata_validation: {
+          statut_validation: "en_attente",
+          erreurs_signalees: [],
+          commentaires_correction: "",
+        },
       });
     }
+  } catch (err) {
+    return c.json({
+      success: false,
+      erreur: err.message || "Erreur interne du serveur",
+    }, 500);
+  }
+});
+
+// Endpoint de validation/feedback (boucle de correction depuis le Front-End)
+app.post("/valider-bulletin", async (c) => {
+  try {
+    const body = await c.req.json();
+
+    const { donnees_ia, metadata_validation } = body;
+
+    if (!donnees_ia || !metadata_validation) {
+      return c.json({
+        success: false,
+        erreur: "Le body doit contenir 'donnees_ia' et 'metadata_validation'.",
+      }, 422);
+    }
+
+    const { statut_validation, erreurs_signalees, commentaires_correction } = metadata_validation;
+
+    if (!statut_validation) {
+      return c.json({
+        success: false,
+        erreur: "'metadata_validation.statut_validation' est requis.",
+      }, 422);
+    }
+
+    // Persister dans D1
+    const result = await c.env.DB.prepare(
+      `INSERT INTO bulletins_valides (donnees_ia, statut_validation, erreurs_signalees, commentaires_correction)
+       VALUES (?, ?, ?, ?)`
+    )
+      .bind(
+        JSON.stringify(donnees_ia),
+        statut_validation,
+        JSON.stringify(erreurs_signalees || []),
+        commentaires_correction || ""
+      )
+      .run();
+
+    return c.json({
+      success: true,
+      message: "Feedback enregistré avec succès",
+      id: result.meta.last_row_id,
+      statut: statut_validation,
+    });
+  } catch (err) {
+    return c.json({
+      success: false,
+      erreur: err.message || "Erreur interne du serveur",
+    }, 500);
+  }
+});
+
+// Lister les bulletins validés
+app.get("/bulletins", async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM bulletins_valides ORDER BY created_at DESC"
+    ).all();
+
+    const bulletins = results.map((row) => ({
+      id: row.id,
+      donnees_ia: JSON.parse(row.donnees_ia),
+      metadata_validation: {
+        statut_validation: row.statut_validation,
+        erreurs_signalees: JSON.parse(row.erreurs_signalees),
+        commentaires_correction: row.commentaires_correction,
+      },
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }));
+
+    return c.json({ success: true, total: bulletins.length, bulletins });
+  } catch (err) {
+    return c.json({
+      success: false,
+      erreur: err.message || "Erreur interne du serveur",
+    }, 500);
+  }
+});
+
+// Récupérer un bulletin par ID
+app.get("/bulletins/:id", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const row = await c.env.DB.prepare(
+      "SELECT * FROM bulletins_valides WHERE id = ?"
+    ).bind(id).first();
+
+    if (!row) {
+      return c.json({ success: false, erreur: "Bulletin non trouvé" }, 404);
+    }
+
+    return c.json({
+      success: true,
+      bulletin: {
+        id: row.id,
+        donnees_ia: JSON.parse(row.donnees_ia),
+        metadata_validation: {
+          statut_validation: row.statut_validation,
+          erreurs_signalees: JSON.parse(row.erreurs_signalees),
+          commentaires_correction: row.commentaires_correction,
+        },
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      },
+    });
   } catch (err) {
     return c.json({
       success: false,
