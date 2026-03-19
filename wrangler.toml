@@ -1,6 +1,16 @@
 name = "ocr-api-bh-assurance"
 main = "src/index.js"
 compatibility_date = "2024-12-01"
+account_id = "6435a77d3ce17b7de468c6618e7b2b14"
 
-[vars]
-GEMINI_API_KEY = "AIzaSyB6O8Di2QI43BuGwpfua5FqWJtZJBnwp2E"
+# ============ DEV ============
+[env.dev]
+name = "ocr-api-bh-assurance-dev"
+
+# ============ STAGING ============
+[env.staging]
+name = "ocr-api-bh-assurance-staging"
+
+# ============ PROD ============
+[env.prod]
+name = "ocr-api-bh-assurance"
