@@ -7,10 +7,45 @@ const app = new Hono();
 
 app.use("/*", cors());
 
-const PROMPT = `Analyse ces images d'un bulletin de soins BH Assurance.
+const TYPES_SOINS_TUNISIE = [
+  "consultation",
+  "consultation specialisee",
+  "analyse biologique",
+  "analyse medicale",
+  "radiologie",
+  "echographie",
+  "scanner",
+  "IRM",
+  "pharmacie",
+  "chirurgie",
+  "hospitalisation",
+  "soins dentaires",
+  "prothese dentaire",
+  "optique",
+  "lunettes",
+  "lentilles",
+  "kinesitherapie",
+  "reeducation fonctionnelle",
+  "soins ambulatoires",
+  "accouchement",
+  "maternite",
+  "dialyse",
+  "chimiotherapie",
+  "radiotherapie",
+  "cure thermale",
+  "appareillage",
+  "prothese orthopedique",
+  "transport sanitaire",
+  "soins infirmiers",
+  "laboratoire",
+  "medecine generale",
+  "medecine de specialite",
+];
+
+const PROMPT = `Analyse ces images d'un bulletin de soins BH Assurance en Tunisie.
 Extrais avec précision TOUTES les informations visibles, en particulier :
 - Le numéro du bulletin de soins (souvent en haut du document)
-- La nature de l'acte médical (consultation, analyse, radiologie, chirurgie, pharmacie, etc.)
+- Le type de soin / nature de l'acte médical
 - La matricule fiscale de chaque praticien (suite de chiffres/lettres identifiant fiscalement le praticien)
 
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
@@ -18,14 +53,17 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 {
   "infos_adherent": {
     "nom_prenom": "",
+    "numero_adherent": "",
     "numero_contrat": "",
     "numero_bulletin": "",
     "adresse": "",
     "beneficiaire_coche": "",
+    "nom_beneficiaire": "",
     "date_signature": ""
   },
   "volet_medical": [
     {
+      "type_soin": "",
       "date_acte": "",
       "nature_acte": "",
       "montant_honoraires": "",
@@ -37,12 +75,25 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 }
 
 IMPORTANT :
+- "nom_prenom" : le nom et prénom de l'adhérent. C'est un document TUNISIEN, donc les noms sont des noms arabes/tunisiens.
+  RÈGLES CRITIQUES pour la lecture des noms manuscrits :
+  1. ATTENTION aux lettres similaires en écriture manuscrite : 'm' et 'n', 'l' et 'i', 'u' et 'v', 'rn' et 'm', 'k' et 'h', 'e' et 'c'.
+  2. Si le texte est en majuscules, convertis en "Nom Prenom" (première lettre majuscule).
+  3. Corrige automatiquement vers un nom tunisien connu si la lecture est ambiguë. Exemples de noms de famille tunisiens courants : Mekki, Meddeb, Ben Ali, Bouazizi, Trabelsi, Gharbi, Jebali, Hammami, Mansouri, Chaabane, Karoui, Sassi, Haddad, Mejri, Dridi, Khemiri, Abidi, Jaziri, Amri, Brahmi, Belhadj, Rezgui, Laabidi, Ferchichi, Bouzid, Ayari, Mbarki, Nefzi, Riahi, Saidi, Khalfi, Baccouche, Ghannouchi, Essid, Marzouki, Naifer, Kefi, Gouider.
+  Exemples de prénoms tunisiens courants : Mohamed, Ahmed, Ali, Fatma, Imen, Dhekra, Amira, Sana, Hela, Rania, Yassine, Sirine, Nour, Hichem, Amine, Karim, Sami, Nabil, Riadh, Mourad, Walid, Slim, Hatem, Ons, Mariem, Asma, Emna, Rim, Ines, Olfa.
+  4. IMPORTANT : "nekk" n'est PAS un nom tunisien, c'est probablement "Mekki". "nohaned" est probablement "Mohamed". Toujours vérifier si le résultat ressemble à un vrai nom tunisien.
+- "numero_adherent" : le numéro d'adhérent, souvent en haut du document ou à côté du nom de l'assuré.
 - "numero_bulletin" : le numéro imprimé sur le bulletin de soins.
-- "nature_acte" : la nature de l'acte médical (ex: consultation, analyse biologique, radiologie, pharmacie, chirurgie, soins dentaires, etc.). Cherche dans la colonne "Nature de l'acte" du tableau.
+- "type_soin" : le type de soin selon le système de santé tunisien. Les valeurs possibles sont : ${TYPES_SOINS_TUNISIE.join(", ")}. Cherche cette information dans la colonne "Nature de l'acte", dans les cases cochées, ou dans les intitulés du document. Si le document indique "médecin" ou "docteur" sans précision, mettre "consultation". Si c'est un labo, mettre "analyse biologique". Si c'est une clinique avec séjour, mettre "hospitalisation".
+- "nature_acte" : description plus détaillée de l'acte (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
 - "matricule_fiscale" : la matricule fiscale du praticien, souvent un code alphanumérique. Cherche attentivement dans le document, elle peut être dans un tableau ou à côté du nom du praticien.
-- Si une valeur n'est pas lisible, mets "illisible". Ne laisse jamais un champ vide.`;
+- "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
+- "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
+- Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
+- Si un champ est REMPLI mais pas lisible (écriture illisible, scan flou), mets "illisible".
+- Ne confonds pas un champ vide avec un champ illisible.`;
 
-const OCR_PROMPT = `Analyse cette image d'un bulletin de soins BH Assurance.
+const OCR_PROMPT = `Analyse cette image d'un bulletin de soins BH Assurance en Tunisie.
 Extrais avec précision TOUTES les informations visibles sur le document.
 
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
@@ -50,6 +101,7 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 {
   "infos_adherent": {
     "nom_prenom": "",
+    "numero_adherent": "",
     "numero_contrat": "",
     "numero_bulletin": "",
     "numero_matricule": "",
@@ -60,6 +112,7 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
     "employeur": "",
     "lien_beneficiaire": "",
     "beneficiaire_coche": "",
+    "nom_beneficiaire": "",
     "date_signature": ""
   },
   "infos_assurance": {
@@ -72,6 +125,7 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
   },
   "volet_medical": [
     {
+      "type_soin": "",
       "date_acte": "",
       "nature_acte": "",
       "description_acte": "",
@@ -110,14 +164,27 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 }
 
 IMPORTANT :
+- "nom_prenom" : le nom et prénom de l'adhérent. C'est un document TUNISIEN, donc les noms sont des noms arabes/tunisiens.
+  RÈGLES CRITIQUES pour la lecture des noms manuscrits :
+  1. ATTENTION aux lettres similaires en écriture manuscrite : 'm' et 'n', 'l' et 'i', 'u' et 'v', 'rn' et 'm', 'k' et 'h', 'e' et 'c'.
+  2. Si le texte est en majuscules, convertis en "Nom Prenom" (première lettre majuscule).
+  3. Corrige automatiquement vers un nom tunisien connu si la lecture est ambiguë. Exemples de noms de famille tunisiens courants : Mekki, Meddeb, Ben Ali, Bouazizi, Trabelsi, Gharbi, Jebali, Hammami, Mansouri, Chaabane, Karoui, Sassi, Haddad, Mejri, Dridi, Khemiri, Abidi, Jaziri, Amri, Brahmi, Belhadj, Rezgui, Laabidi, Ferchichi, Bouzid, Ayari, Mbarki, Nefzi, Riahi, Saidi, Khalfi, Baccouche, Ghannouchi, Essid, Marzouki, Naifer, Kefi, Gouider.
+  Exemples de prénoms tunisiens courants : Mohamed, Ahmed, Ali, Fatma, Imen, Dhekra, Amira, Sana, Hela, Rania, Yassine, Sirine, Nour, Hichem, Amine, Karim, Sami, Nabil, Riadh, Mourad, Walid, Slim, Hatem, Ons, Mariem, Asma, Emna, Rim, Ines, Olfa.
+  4. IMPORTANT : "nekk" n'est PAS un nom tunisien, c'est probablement "Mekki". "nohaned" est probablement "Mohamed". Toujours vérifier si le résultat ressemble à un vrai nom tunisien.
+- "numero_adherent" : le numéro d'adhérent, souvent en haut du document ou à côté du nom de l'assuré.
 - "numero_bulletin" : le numéro imprimé sur le bulletin de soins.
-- "nature_acte" : la nature de l'acte médical (ex: consultation, analyse biologique, radiologie, pharmacie, chirurgie, soins dentaires, hospitalisation, optique, etc.).
+- "type_soin" : le type de soin selon le système de santé tunisien. Les valeurs possibles sont : ${TYPES_SOINS_TUNISIE.join(", ")}. Cherche cette information dans la colonne "Nature de l'acte", dans les cases cochées, ou dans les intitulés du document. Si le document indique "médecin" ou "docteur" sans précision, mettre "consultation". Si c'est un labo, mettre "analyse biologique". Si c'est une clinique avec séjour, mettre "hospitalisation".
+- "nature_acte" : description plus détaillée de l'acte (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
 - "matricule_fiscale" : la matricule fiscale du praticien, souvent un code alphanumérique.
+- "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
+- "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
 - "pharmacie" : si des médicaments sont listés séparément, les mettre dans cette section.
 - "totaux" : les montants totaux si visibles en bas du document.
 - "observations" : toute remarque ou note manuscrite visible sur le document.
 - Si une section n'existe pas dans le document, retourne un tableau vide [] ou un objet vide {}.
-- Si une valeur n'est pas lisible, mets "illisible". Ne laisse jamais un champ vide.`;
+- Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
+- Si un champ est REMPLI mais pas lisible (écriture illisible, scan flou), mets "illisible".
+- Ne confonds pas un champ vide avec un champ illisible.`;
 
 // Helper: convertir un fichier en base64
 async function fileToBase64(file) {
