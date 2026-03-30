@@ -13,6 +13,59 @@ const app = new Hono();
 app.use("/*", cors());
 
 // ─────────────────────────────────────────────
+// Initialisation automatique des tables D1
+// ─────────────────────────────────────────────
+let dbInitialized = false;
+
+async function initDB(db) {
+  if (dbInitialized || !db) return;
+  try {
+    await db.batch([
+      db.prepare(`CREATE TABLE IF NOT EXISTS bulletins_valides (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        donnees_ia            TEXT    NOT NULL,
+        statut_validation     TEXT    NOT NULL DEFAULT 'en_attente',
+        erreurs_signalees     TEXT    NOT NULL DEFAULT '[]',
+        commentaires_correction TEXT  NOT NULL DEFAULT '',
+        created_at            DATETIME DEFAULT (datetime('now'))
+      )`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS usage_logs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint      TEXT    NOT NULL,
+        provider      TEXT,
+        status        TEXT    NOT NULL,
+        nb_fichiers   INTEGER NOT NULL DEFAULT 1,
+        duree_ms      INTEGER,
+        error_message TEXT,
+        created_at    DATETIME DEFAULT (datetime('now'))
+      )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at DESC)`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_usage_logs_status ON usage_logs(status)`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_usage_logs_endpoint ON usage_logs(endpoint)`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS ocr_providers (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        nom         TEXT    NOT NULL UNIQUE,
+        type        TEXT    NOT NULL,
+        api_key     TEXT,
+        modele      TEXT,
+        est_actif   INTEGER NOT NULL DEFAULT 1,
+        config_json TEXT    NOT NULL DEFAULT '{}',
+        created_at  DATETIME DEFAULT (datetime('now')),
+        updated_at  DATETIME DEFAULT (datetime('now'))
+      )`),
+    ]);
+    dbInitialized = true;
+  } catch (e) {
+    console.error("DB init error:", e.message);
+  }
+}
+
+app.use("/*", async (c, next) => {
+  if (c.env.DB) await initDB(c.env.DB);
+  return next();
+});
+
+// ─────────────────────────────────────────────
 // Monter la plateforme d'administration
 // Route : /admin/**
 // ─────────────────────────────────────────────
