@@ -8,6 +8,22 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 import admin from "./admin.js";
 import { logUsageEvent } from "./stats.js";
 
+const TYPES_SOINS_TUNISIE = [
+  "consultation",
+  "analyse biologique",
+  "radiologie",
+  "pharmacie",
+  "chirurgie",
+  "soins dentaires",
+  "hospitalisation",
+  "optique",
+  "kinésithérapie",
+  "maternité",
+  "prothèse",
+  "orthopédie",
+  "autre",
+];
+
 const app = new Hono();
 
 app.use("/*", cors());
@@ -103,11 +119,51 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
   ]
 }
 
+RÈGLE ABSOLUE - NE JAMAIS INVENTER :
+- Tu ne dois JAMAIS inventer, deviner ou halluciner une donnée.
+- Si un champ n'est PAS visible sur le document, mets une chaîne vide "".
+- Si un champ est visible mais illisible, mets "illisible".
+- NE JAMAIS remplir un champ avec une valeur que tu ne vois pas explicitement écrite sur le document.
+- Mieux vaut retourner "" que d'inventer une valeur fausse.
+
+ÉTAPE 1 - LECTURE PIXEL PAR PIXEL :
+Avant d'extraire les données, examine attentivement chaque zone du document. Zoome mentalement sur chaque champ manuscrit et lis lettre par lettre, chiffre par chiffre.
+
+ÉTAPE 2 - EXTRACTION DES CHAMPS :
+
 IMPORTANT :
+- "nom_prenom" : le nom et prénom de l'adhérent. C'est un document TUNISIEN, donc les noms sont des noms arabes/tunisiens.
+  RÈGLES CRITIQUES pour la lecture des noms manuscrits :
+  1. ATTENTION aux lettres similaires en écriture manuscrite : 'm' et 'n', 'l' et 'i', 'u' et 'v', 'rn' et 'm', 'k' et 'h', 'e' et 'c'.
+  2. Si le texte est en majuscules, convertis en "Nom Prenom" (première lettre majuscule).
+  3. Corrige automatiquement vers un nom tunisien connu si la lecture est ambiguë. Exemples de noms de famille tunisiens courants : Mekki, Meddeb, Ben Ali, Bouazizi, Trabelsi, Gharbi, Jebali, Hammami, Mansouri, Chaabane, Karoui, Sassi, Haddad, Mejri, Dridi, Khemiri, Abidi, Jaziri, Amri, Brahmi, Belhadj, Rezgui, Laabidi, Ferchichi, Bouzid, Ayari, Mbarki, Nefzi, Riahi, Saidi, Khalfi, Baccouche, Ghannouchi, Essid, Marzouki, Naifer, Kefi, Gouider.
+  Exemples de prénoms tunisiens courants : Mohamed, Ahmed, Ali, Fatma, Imen, Dhekra, Amira, Sana, Hela, Rania, Yassine, Sirine, Nour, Hichem, Amine, Karim, Sami, Nabil, Riadh, Mourad, Walid, Slim, Hatem, Ons, Mariem, Asma, Emna, Rim, Ines, Olfa.
+  4. IMPORTANT : "nekk" n'est PAS un nom tunisien, c'est probablement "Mekki". "nohaned" est probablement "Mohamed". Toujours vérifier si le résultat ressemble à un vrai nom tunisien.
+
+- "nom_praticien" : le nom du médecin/praticien. Il se trouve généralement :
+  1. Dans le TAMPON/CACHET du médecin (texte imprimé dans un cadre rond ou rectangulaire).
+  2. Précédé de "Dr", "Dr.", "Docteur", ou "Médecin".
+  3. Parfois en signature manuscrite à côté du tampon.
+  RÈGLES : Lis d'abord le tampon (texte imprimé = plus fiable que manuscrit). Le tampon contient souvent "Dr NOM Prénom" ou "Dr Prénom NOM" suivi de la spécialité. Applique les mêmes règles de noms tunisiens que pour "nom_prenom".
+
+- "numero_contrat" : le numéro de contrat/police d'assurance.
+  ATTENTION : Ce champ est souvent un numéro IMPRIMÉ ou TAMPONNÉ (pas manuscrit). Cherche-le :
+  1. En haut du document dans la zone d'identification.
+  2. Sous le tampon ou cachet de l'entreprise/employeur.
+  3. À côté des mentions "N° Contrat", "Police N°", "Contrat N°".
+  Lis chaque chiffre individuellement. Attention aux confusions : 0/O, 1/I/l, 5/S, 8/B, 6/G.
+
+- "numero_adherent" : le numéro d'adhérent, souvent en haut du document ou à côté du nom de l'assuré.
 - "numero_bulletin" : le numéro imprimé sur le bulletin de soins.
-- "nature_acte" : la nature de l'acte médical (ex: consultation, analyse biologique, radiologie, pharmacie, chirurgie, soins dentaires, etc.). Cherche dans la colonne "Nature de l'acte" du tableau.
-- "matricule_fiscale" : la matricule fiscale du praticien, souvent un code alphanumérique. Cherche attentivement dans le document, elle peut être dans un tableau ou à côté du nom du praticien.
-- Si une valeur n'est pas lisible, mets "illisible". Ne laisse jamais un champ vide.`;
+- "type_soin" : le type de soin selon le système de santé tunisien. Les valeurs possibles sont : ${TYPES_SOINS_TUNISIE.join(", ")}. Cherche cette information dans la colonne "Nature de l'acte", dans les cases cochées, ou dans les intitulés du document. Si le document indique "médecin" ou "docteur" sans précision, mettre "consultation". Si c'est un labo, mettre "analyse biologique". Si c'est une clinique avec séjour, mettre "hospitalisation".
+- "nature_acte" : description plus détaillée de l'acte (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
+- "matricule_fiscale" : la matricule fiscale du praticien. NE JAMAIS INVENTER ce champ. Si tu ne vois PAS clairement un code alphanumérique (format tunisien : 7 chiffres + lettre + 3 caractères, ex: "1234567A/P/M/000") écrit sur le document (dans le tampon, le tableau ou à côté du praticien), mets "". Ne confonds pas avec le numéro de téléphone ou le numéro d'ordre du médecin.
+- "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
+- "nom_beneficiaire" : UNIQUEMENT le nom écrit sur le document dans le champ "Nom et Prénom du malade". Recopie EXACTEMENT ce qui est écrit, ne rajoute RIEN. Si le champ est vide sur le document, mets "". NE JAMAIS ajouter un nom qui n'est pas écrit dans cette zone.
+- "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
+- Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
+- Si un champ est REMPLI mais pas lisible (écriture illisible, scan flou), mets "illisible".
+- Ne confonds pas un champ vide avec un champ illisible.`;
 
 const OCR_PROMPT = `Analyse cette image d'un bulletin de soins BH Assurance.
 Extrais avec précision TOUTES les informations visibles sur le document.
@@ -199,9 +255,41 @@ async function fileToBase64(file) {
   return btoa(binary);
 }
 
-function createModel(env) {
+// Modèles Gemini par ordre de préférence
+const GEMINI_MODELS = [
+  "gemini-3.1-flash-lite-preview",
+  "gemini-2.0-flash",
+  "gemini-2.5-flash",
+];
+
+// Helper: générer du contenu avec fallback automatique entre modèles
+async function generateWithFallback(env, parts) {
   const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-  return genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  let lastError;
+
+  for (const modelName of GEMINI_MODELS) {
+    try {
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: {
+          responseMimeType: "application/json",
+          temperature: 0,
+        },
+      });
+      const result = await model.generateContent(parts);
+      result.modelUsed = modelName;
+      return result;
+    } catch (err) {
+      lastError = err;
+      const status = err.message || "";
+      if (status.includes("503") || status.includes("429") || status.includes("500")) {
+        console.log(`Modèle ${modelName} indisponible, tentative suivante...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
 }
 
 // ─────────────────────────────────────────────
@@ -380,8 +468,6 @@ app.post("/analyse-bulletin", async (c) => {
       return c.json({ error: "Aucun fichier envoyé" }, 422);
     }
 
-    const model = createModel(c.env);
-
     const imageParts = await Promise.all(
       files.map(async (file) => {
         const base64 = await fileToBase64(file);
@@ -389,7 +475,7 @@ app.post("/analyse-bulletin", async (c) => {
       })
     );
 
-    const result = await model.generateContent([PROMPT, ...imageParts]);
+    const result = await generateWithFallback(c.env, [PROMPT, ...imageParts]);
     const text = result.response.text();
 
     let data = null;
@@ -591,5 +677,71 @@ app.get("/bulletins/:id", async (c) => {
     return c.json({ success: false, erreur: err.message }, 500);
   }
 });
+
+// Endpoint compatible avec le projet Python (POST /ocr, un seul fichier, retourne du texte brut)
+app.post("/ocr", async (c) => {
+  try {
+    const formData = await c.req.formData();
+    const file = formData.get("file");
+
+    if (!file) {
+      return c.json({ error: "Aucun fichier envoyé" }, 422);
+    }
+
+    const base64 = await fileToBase64(file);
+
+    const result = await generateWithFallback(c.env, [
+      OCR_PROMPT,
+      { inlineData: { data: base64, mimeType: file.type || "image/jpeg" } },
+    ]);
+
+    const text = result.response.text();
+
+    try {
+      const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+      const data = JSON.parse(cleaned);
+      return c.json({
+        success: true,
+        resultat: data,
+      });
+    } catch {
+      return c.json({
+        success: true,
+        resultat: null,
+        reponse_brute: text,
+        avertissement: "La réponse n'a pas pu être parsée en JSON structuré.",
+      });
+    }
+  } catch (err) {
+    return c.json({
+      success: false,
+      erreur: err.message || "Erreur interne du serveur",
+    }, 500);
+  }
+});
+
+/* ============================================================
+   GEMINI VERSION (commentée) - Décommenter pour utiliser Gemini
+   ============================================================
+
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+// Dans /analyse-bulletin :
+const genAI = new GoogleGenerativeAI(c.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-3.1-flash-lite-preview" });
+const imageParts = files.map(file => ({
+  inlineData: { data: base64, mimeType: file.type || "image/jpeg" }
+}));
+const result = await model.generateContent([PROMPT, ...imageParts]);
+const text = result.response.text();
+
+// Dans /ocr :
+const result = await model.generateContent([
+  "Extrais tout le texte visible dans cette image...",
+  { inlineData: { data: base64, mimeType: file.type || "image/jpeg" } },
+]);
+return c.json({ text: result.response.text() });
+
+============================================================ */
 
 export default app;
