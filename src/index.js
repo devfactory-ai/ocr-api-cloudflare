@@ -91,30 +91,40 @@ app.route("/admin", admin);
 // Prompts OCR
 // ─────────────────────────────────────────────
 const PROMPT = `Analyse ces images d'un bulletin de soins BH Assurance.
-Extrais avec précision TOUTES les informations visibles, en particulier :
-- Le numéro du bulletin de soins (souvent en haut du document)
-- La nature de l'acte médical (consultation, analyse, radiologie, chirurgie, pharmacie, etc.)
-- La matricule fiscale de chaque praticien (suite de chiffres/lettres identifiant fiscalement le praticien)
+Extrais avec précision TOUTES les informations visibles.
 
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 
 {
-  "infos_adherent": {
+  "adherent": {
     "nom_prenom": "",
     "numero_contrat": "",
+    "numero_adherent": "",
     "numero_bulletin": "",
     "adresse": "",
-    "beneficiaire_coche": "",
-    "date_signature": ""
+    "date_signature": "",
+    "beneficiaire": "adherent",
+    "conjoint": {
+      "nom_prenom": ""
+    },
+    "enfants": [
+      {
+        "nom_prenom": ""
+      }
+    ]
   },
-  "volet_medical": [
+  "actes": [
     {
-      "date_acte": "",
+      "type_soin": "",
       "nature_acte": "",
+      "date_acte": "",
+      "praticien": {
+        "nom_prenom": "",
+        "specialite": "",
+        "matricule_fiscale": ""
+      },
       "montant_honoraires": "",
-      "montant_facture": "",
-      "nom_praticien": "",
-      "matricule_fiscale": ""
+      "montant_facture": ""
     }
   ]
 }
@@ -123,47 +133,48 @@ RÈGLE ABSOLUE - NE JAMAIS INVENTER :
 - Tu ne dois JAMAIS inventer, deviner ou halluciner une donnée.
 - Si un champ n'est PAS visible sur le document, mets une chaîne vide "".
 - Si un champ est visible mais illisible, mets "illisible".
-- NE JAMAIS remplir un champ avec une valeur que tu ne vois pas explicitement écrite sur le document.
 - Mieux vaut retourner "" que d'inventer une valeur fausse.
 
 ÉTAPE 1 - LECTURE PIXEL PAR PIXEL :
-Avant d'extraire les données, examine attentivement chaque zone du document. Zoome mentalement sur chaque champ manuscrit et lis lettre par lettre, chiffre par chiffre.
+Examine attentivement chaque zone du document. Lis lettre par lettre, chiffre par chiffre.
 
 ÉTAPE 2 - EXTRACTION DES CHAMPS :
 
-IMPORTANT :
-- "nom_prenom" : le nom et prénom de l'adhérent. C'est un document TUNISIEN, donc les noms sont des noms arabes/tunisiens.
-  RÈGLES CRITIQUES pour la lecture des noms manuscrits :
-  1. ATTENTION aux lettres similaires en écriture manuscrite : 'm' et 'n', 'l' et 'i', 'u' et 'v', 'rn' et 'm', 'k' et 'h', 'e' et 'c'.
-  2. Si le texte est en majuscules, convertis en "Nom Prenom" (première lettre majuscule).
-  3. Corrige automatiquement vers un nom tunisien connu si la lecture est ambiguë. Exemples de noms de famille tunisiens courants : Mekki, Meddeb, Ben Ali, Bouazizi, Trabelsi, Gharbi, Jebali, Hammami, Mansouri, Chaabane, Karoui, Sassi, Haddad, Mejri, Dridi, Khemiri, Abidi, Jaziri, Amri, Brahmi, Belhadj, Rezgui, Laabidi, Ferchichi, Bouzid, Ayari, Mbarki, Nefzi, Riahi, Saidi, Khalfi, Baccouche, Ghannouchi, Essid, Marzouki, Naifer, Kefi, Gouider.
-  Exemples de prénoms tunisiens courants : Mohamed, Ahmed, Ali, Fatma, Imen, Dhekra, Amira, Sana, Hela, Rania, Yassine, Sirine, Nour, Hichem, Amine, Karim, Sami, Nabil, Riadh, Mourad, Walid, Slim, Hatem, Ons, Mariem, Asma, Emna, Rim, Ines, Olfa.
-  4. IMPORTANT : "nekk" n'est PAS un nom tunisien, c'est probablement "Mekki". "nohaned" est probablement "Mohamed". Toujours vérifier si le résultat ressemble à un vrai nom tunisien.
+SECTION ADHÉRENT :
+- "nom_prenom" : nom et prénom de l'adhérent principal. C'est un document TUNISIEN, noms arabes/tunisiens.
+  RÈGLES pour les noms manuscrits :
+  1. ATTENTION lettres similaires : 'm'/'n', 'l'/'i', 'u'/'v', 'rn'/'m', 'k'/'h'.
+  2. Majuscules → convertir en "Nom Prenom".
+  3. Corrige vers un nom tunisien connu si ambigu. Noms courants : Mekki, Meddeb, Ben Ali, Bouazizi, Trabelsi, Gharbi, Jebali, Hammami, Mansouri, Chaabane, Karoui, Sassi, Haddad, Mejri, Dridi, Khemiri, Abidi, Jaziri, Amri, Brahmi, Belhadj, Rezgui, Laabidi, Ferchichi, Bouzid, Ayari, Mbarki, Nefzi, Riahi, Saidi, Khalfi.
+  Prénoms courants : Mohamed, Ahmed, Ali, Fatma, Imen, Dhekra, Amira, Sana, Hela, Rania, Yassine, Sirine, Nour, Hichem, Amine, Karim, Sami, Nabil, Riadh, Mourad, Walid, Slim, Hatem, Ons, Mariem, Asma, Emna, Rim, Ines, Olfa.
+  4. "nekk" → probablement "Mekki". "nohaned" → probablement "Mohamed".
 
-- "nom_praticien" : le nom du médecin/praticien. Il se trouve généralement :
-  1. Dans le TAMPON/CACHET du médecin (texte imprimé dans un cadre rond ou rectangulaire).
-  2. Précédé de "Dr", "Dr.", "Docteur", ou "Médecin".
-  3. Parfois en signature manuscrite à côté du tampon.
-  RÈGLES : Lis d'abord le tampon (texte imprimé = plus fiable que manuscrit). Le tampon contient souvent "Dr NOM Prénom" ou "Dr Prénom NOM" suivi de la spécialité. Applique les mêmes règles de noms tunisiens que pour "nom_prenom".
+- "numero_contrat" : souvent IMPRIMÉ/TAMPONNÉ. Cherche près de "N° Contrat", "Police N°". Attention : 0/O, 1/I/l, 5/S, 8/B.
+- "numero_adherent" : numéro d'adhérent, souvent en haut du document.
+- "numero_bulletin" : numéro imprimé sur le bulletin.
 
-- "numero_contrat" : le numéro de contrat/police d'assurance.
-  ATTENTION : Ce champ est souvent un numéro IMPRIMÉ ou TAMPONNÉ (pas manuscrit). Cherche-le :
-  1. En haut du document dans la zone d'identification.
-  2. Sous le tampon ou cachet de l'entreprise/employeur.
-  3. À côté des mentions "N° Contrat", "Police N°", "Contrat N°".
-  Lis chaque chiffre individuellement. Attention aux confusions : 0/O, 1/I/l, 5/S, 8/B, 6/G.
+SECTION BÉNÉFICIAIRE :
+- "beneficiaire" : qui est le malade ? Lis la case cochée sur le bulletin :
+  - Si "Adhérent" coché ou aucune case → "adherent"
+  - Si "Conjoint" coché → "conjoint"
+  - Si "Enfant" coché → "enfant"
+- "conjoint.nom_prenom" : UNIQUEMENT si la case "Conjoint" est cochée, lis le nom du malade dans la section praticien "Nom et Prénom du malade". Si pas coché ou pas visible, mets "".
+- "enfants" : UNIQUEMENT si la case "Enfant" est cochée, lis le nom de l'enfant malade. Si pas coché ou pas visible, mets un tableau vide [].
 
-- "numero_adherent" : le numéro d'adhérent, souvent en haut du document ou à côté du nom de l'assuré.
-- "numero_bulletin" : le numéro imprimé sur le bulletin de soins.
-- "type_soin" : le type de soin selon le système de santé tunisien. Les valeurs possibles sont : ${TYPES_SOINS_TUNISIE.join(", ")}. Cherche cette information dans la colonne "Nature de l'acte", dans les cases cochées, ou dans les intitulés du document. Si le document indique "médecin" ou "docteur" sans précision, mettre "consultation". Si c'est un labo, mettre "analyse biologique". Si c'est une clinique avec séjour, mettre "hospitalisation".
-- "nature_acte" : description plus détaillée de l'acte (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
-- "matricule_fiscale" : la matricule fiscale du praticien. NE JAMAIS INVENTER ce champ. Si tu ne vois PAS clairement un code alphanumérique (format tunisien : 7 chiffres + lettre + 3 caractères, ex: "1234567A/P/M/000") écrit sur le document (dans le tampon, le tableau ou à côté du praticien), mets "". Ne confonds pas avec le numéro de téléphone ou le numéro d'ordre du médecin.
-- "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
-- "nom_beneficiaire" : UNIQUEMENT le nom écrit sur le document dans le champ "Nom et Prénom du malade". Recopie EXACTEMENT ce qui est écrit, ne rajoute RIEN. Si le champ est vide sur le document, mets "". NE JAMAIS ajouter un nom qui n'est pas écrit dans cette zone.
-- "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
-- Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
-- Si un champ est REMPLI mais pas lisible (écriture illisible, scan flou), mets "illisible".
-- Ne confonds pas un champ vide avec un champ illisible.`;
+SECTION ACTES :
+- Chaque ligne du volet médical = un acte séparé dans le tableau "actes".
+- "type_soin" : ${TYPES_SOINS_TUNISIE.join(", ")}. Si "médecin"/"docteur" sans précision → "consultation". Labo → "analyse biologique". Clinique avec séjour → "hospitalisation".
+- "nature_acte" : description détaillée (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
+- "praticien.nom_prenom" : cherche dans le TAMPON/CACHET (plus fiable que manuscrit). Format "Dr NOM Prénom" + spécialité.
+- "praticien.specialite" : la spécialité du médecin si visible dans le tampon.
+- "praticien.matricule_fiscale" : NE JAMAIS INVENTER. Format tunisien : 7 chiffres + lettre + 3 caractères (ex: "1234567A/P/M/000"). Si pas visible clairement, mets "".
+- "montant_honoraires" : attention aux chiffres manuscrits (0/6, 1/7, 5/8). Format avec virgule/point décimal.
+- "montant_facture" : montant facturé si différent des honoraires.
+
+RÈGLES FINALES :
+- Champ VIDE sur le document → ""
+- Champ REMPLI mais illisible → "illisible"
+- Ne confonds pas vide et illisible.`;
 
 const OCR_PROMPT = `Analyse cette image d'un bulletin de soins BH Assurance.
 Extrais avec précision TOUTES les informations visibles sur le document.
@@ -300,7 +311,7 @@ app.get("/", (c) => {
     message: "API OCR BH Assurance active",
     version: "2.0.0",
     endpoints: [
-      "POST /analyse-bulletin",
+      "POST /analyse-bulletin  (bulletin + reçus + analyses + ordonnances...)",
       "POST /ocr",
       "POST /valider",
       "GET  /bulletins",
@@ -330,8 +341,8 @@ app.get("/openapi.json", (c) => {
       },
       "/analyse-bulletin": {
         post: {
-          summary: "Analyser un bulletin de soins",
-          description: "Envoie une ou plusieurs images de bulletin de soins pour extraction OCR via Gemini AI",
+          summary: "Analyser un dossier médical complet",
+          description: "Envoie une ou plusieurs images (bulletin de soin, reçus, analyses, ordonnances, factures). Chaque fichier est automatiquement classifié puis extrait avec un prompt adapté à son type.",
           requestBody: {
             required: true,
             content: {
@@ -342,7 +353,7 @@ app.get("/openapi.json", (c) => {
                     files: {
                       type: "array",
                       items: { type: "string", format: "binary" },
-                      description: "Images du bulletin de soins (JPEG, PNG)",
+                      description: "Images des documents médicaux (JPEG, PNG) — bulletin, reçu, analyse, ordonnance, facture, etc.",
                     },
                   },
                   required: ["files"],
@@ -351,7 +362,24 @@ app.get("/openapi.json", (c) => {
             },
           },
           responses: {
-            200: { description: "Données extraites du bulletin" },
+            200: {
+              description: "Dossier médical structuré",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      success: { type: "boolean" },
+                      nombre_fichiers: { type: "integer" },
+                      resultat: {
+                        type: "object",
+                        description: "Dossier unifié : adherent + actes (avec ordonnance, pharmacie, analyse intégrés dans chaque acte)",
+                      },
+                    },
+                  },
+                },
+              },
+            },
             422: { description: "Aucun fichier envoyé" },
           },
         },
@@ -456,7 +484,107 @@ app.get("/docs", (c) => {
 });
 
 // ─────────────────────────────────────────────
+// Prompt unifié multi-documents
+// Envoie toutes les images ensemble → Gemini produit un dossier propre
+// ─────────────────────────────────────────────
+const PROMPT_DOSSIER = `Tu reçois plusieurs images qui font partie du MÊME dossier médical d'un adhérent BH Assurance en Tunisie.
+Ces images peuvent inclure : un bulletin de soins, des reçus, des ordonnances, des résultats d'analyse, des factures, etc.
+
+Tu dois COMBINER toutes ces images pour produire UN SEUL dossier structuré et complet.
+
+IMPORTANT :
+- Le bulletin de soins est le document PRINCIPAL (il a un numéro de bulletin imprimé).
+- Les autres documents (reçus, ordonnances, analyses) sont des PIÈCES JUSTIFICATIVES qui complètent les actes du bulletin.
+- Croise les informations entre les documents : si le bulletin a un acte "consultation" vide, mais qu'un reçu montre "Dr Driss, 50 DT, consultation", remplis l'acte avec ces infos.
+- Un praticien apparaît souvent sur plusieurs documents (bulletin + ordonnance + reçu). Unifie les informations.
+
+Retourne UNIQUEMENT ce JSON :
+
+{
+  "adherent": {
+    "nom_prenom": "",
+    "numero_contrat": "",
+    "numero_adherent": "",
+    "numero_bulletin": "",
+    "adresse": "",
+    "beneficiaire": "adherent",
+    "conjoint": { "nom_prenom": "" },
+    "enfants": [{ "nom_prenom": "" }]
+  },
+  "actes": [
+    {
+      "type_soin": "",
+      "nature_acte": "",
+      "date_acte": "",
+      "praticien": {
+        "nom_prenom": "",
+        "specialite": "",
+        "matricule_fiscale": ""
+      },
+      "montant_honoraires": "",
+      "montant_facture": "",
+      "ordonnance": {
+        "medicaments": [
+          {
+            "nom": "",
+            "dosage": "",
+            "posologie": "",
+            "duree": ""
+          }
+        ]
+      },
+      "pharmacie": {
+        "nom_pharmacie": "",
+        "date_achat": "",
+        "medicaments": [
+          {
+            "nom": "",
+            "quantite": "",
+            "prix": ""
+          }
+        ],
+        "total": ""
+      },
+      "analyse": {
+        "nom_laboratoire": "",
+        "date": "",
+        "resultats": [
+          {
+            "nom": "",
+            "resultat": "",
+            "valeurs_normales": ""
+          }
+        ]
+      }
+    }
+  ],
+  "total_dossier": {
+    "total_honoraires": "",
+    "total_pharmacie": "",
+    "total_general": ""
+  }
+}
+
+RÈGLES :
+- "beneficiaire" : lis la case cochée → "adherent", "conjoint" ou "enfant".
+- "conjoint.nom_prenom" : remplis UNIQUEMENT si case "Conjoint" cochée. Le nom du malade se trouve dans la section praticien du bulletin OU sur les ordonnances/reçus.
+- "enfants" : remplis UNIQUEMENT si case "Enfant" cochée. Sinon tableau vide [].
+- Chaque acte = un soin distinct. Si le bulletin montre une ligne "consultation" et qu'une ordonnance du même médecin existe → c'est le MÊME acte, mets l'ordonnance DANS cet acte.
+- "ordonnance", "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si un document correspondant existe dans les images. Si pas de document → ne mets pas la clé.
+- NE JAMAIS inventer de données. Si pas visible → "".
+- NE JAMAIS mettre "illisible" partout. Si un champ n'est vraiment pas lisible, mets "". Réserve "illisible" UNIQUEMENT pour les champs où tu vois du texte mais ne peux pas le déchiffrer.
+- Les noms sont tunisiens. Mêmes règles de correction : "nekk" → "Mekki", "nohaned" → "Mohamed".
+- "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
+- "type_soin" : ${TYPES_SOINS_TUNISIE.join(", ")}.
+
+ÉTAPE 1 : Identifie chaque image (bulletin, ordonnance, reçu, analyse...).
+ÉTAPE 2 : Extrais l'adhérent depuis le bulletin.
+ÉTAPE 3 : Pour chaque acte du bulletin, cherche dans les AUTRES images les documents qui correspondent (même médecin, même date, même patient) et intègre-les dans l'acte.`;
+
+// ─────────────────────────────────────────────
 // POST /analyse-bulletin
+// 1 fichier  → prompt bulletin simple
+// N fichiers → prompt unifié qui croise toutes les images
 // ─────────────────────────────────────────────
 app.post("/analyse-bulletin", async (c) => {
   const startTime = Date.now();
@@ -468,6 +596,7 @@ app.post("/analyse-bulletin", async (c) => {
       return c.json({ error: "Aucun fichier envoyé" }, 422);
     }
 
+    // Convertir tous les fichiers en base64
     const imageParts = await Promise.all(
       files.map(async (file) => {
         const base64 = await fileToBase64(file);
@@ -475,7 +604,9 @@ app.post("/analyse-bulletin", async (c) => {
       })
     );
 
-    const result = await generateWithFallback(c.env, [PROMPT, ...imageParts]);
+    // Choisir le prompt : simple pour 1 fichier, unifié pour plusieurs
+    const prompt = files.length === 1 ? PROMPT : PROMPT_DOSSIER;
+    const result = await generateWithFallback(c.env, [prompt, ...imageParts]);
     const text = result.response.text();
 
     let data = null;
