@@ -10,8 +10,12 @@ import { logUsageEvent } from "./stats.js";
 
 const TYPES_SOINS_TUNISIE = [
   "consultation",
+  "consultation spécialiste",
   "analyse biologique",
   "radiologie",
+  "échographie",
+  "scanner",
+  "IRM",
   "pharmacie",
   "chirurgie",
   "soins dentaires",
@@ -21,6 +25,8 @@ const TYPES_SOINS_TUNISIE = [
   "maternité",
   "prothèse",
   "orthopédie",
+  "soins infirmiers",
+  "médecine de contrôle",
   "autre",
 ];
 
@@ -163,18 +169,34 @@ SECTION BÉNÉFICIAIRE :
 
 SECTION ACTES :
 - Chaque ligne du volet médical = un acte séparé dans le tableau "actes".
-- "type_soin" : ${TYPES_SOINS_TUNISIE.join(", ")}. Si "médecin"/"docteur" sans précision → "consultation". Labo → "analyse biologique". Clinique avec séjour → "hospitalisation".
-- "nature_acte" : description détaillée (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
+- "type_soin" : ${TYPES_SOINS_TUNISIE.join(", ")}. Si "médecin"/"docteur" sans précision → "consultation". Labo → "analyse biologique". Clinique avec séjour → "hospitalisation". Radio/écho/scanner/IRM → type correspondant.
+- "nature_acte" : description détaillée (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax", "échographie abdominale").
 - "praticien.nom_prenom" : cherche dans le TAMPON/CACHET (plus fiable que manuscrit). Format "Dr NOM Prénom" + spécialité.
 - "praticien.specialite" : la spécialité du médecin si visible dans le tampon.
 - "praticien.matricule_fiscale" : NE JAMAIS INVENTER. Format tunisien : 7 chiffres + lettre + 3 caractères (ex: "1234567A/P/M/000"). Si pas visible clairement, mets "".
 - "montant_honoraires" : attention aux chiffres manuscrits (0/6, 1/7, 5/8). Format avec virgule/point décimal.
 - "montant_facture" : montant facturé si différent des honoraires.
 
+EXTRACTION DU TAMPON/CACHET (CRITIQUE) :
+- Le tampon/cachet est une source d'information TRÈS FIABLE car il est imprimé. Il contient souvent :
+  * Nom complet du praticien et sa spécialité
+  * Adresse du cabinet
+  * Numéro de téléphone
+  * Matricule fiscale
+  * Numéro d'inscription à l'ordre des médecins
+- Lis CHAQUE tampon/cachet sur le document. Il peut y avoir plusieurs tampons (médecin, pharmacie, labo).
+- Les informations du tampon COMPLÈTENT ou CORRIGENT les informations manuscrites.
+
+RÈGLE CRITIQUE - MONTANTS :
+- Les montants sont des informations ESSENTIELLES. Fais un effort maximal pour les lire.
+- Si un montant est VISIBLE sur le document (même partiellement lisible), tu DOIS l'extraire. Ne mets "" que si le champ montant est réellement ABSENT.
+- Les montants manuscrits : lis attentivement chiffre par chiffre. 0/6, 1/7, 5/8, 3/8 sont souvent confondus.
+- Garde le format tel qu'il apparaît (ex: "45.000", "120,500", "35 DT").
+
 RÈGLES FINALES :
-- Champ VIDE sur le document → ""
+- Champ ABSENT du document → ""
 - Champ REMPLI mais illisible → "illisible"
-- Ne confonds pas vide et illisible.`;
+- Ne confonds pas absent et illisible. Un champ est absent s'il n'existe pas du tout. Un champ est illisible si du texte est présent mais indéchiffrable.`;
 
 const OCR_PROMPT = `Analyse cette image d'un bulletin de soins BH Assurance.
 Extrais avec précision TOUTES les informations visibles sur le document.
@@ -259,11 +281,13 @@ IMPORTANT :
 async function fileToBase64(file) {
   const buffer = await file.arrayBuffer();
   const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  // Traitement par chunks pour éviter la concaténation O(n²)
+  const CHUNK = 8192;
+  const chunks = [];
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    chunks.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
   }
-  return btoa(binary);
+  return btoa(chunks.join(""));
 }
 
 // Modèles Gemini par ordre de préférence
@@ -283,8 +307,8 @@ async function generateWithFallback(env, parts) {
       const model = genAI.getGenerativeModel({
         model: modelName,
         generationConfig: {
-          responseMimeType: "application/json",
-          temperature: 0,
+          temperature: 0.3,
+          maxOutputTokens: 8192,
         },
       });
       const result = await model.generateContent(parts);
@@ -497,6 +521,11 @@ IMPORTANT :
 - Les autres documents (reçus, ordonnances, analyses) sont des PIÈCES JUSTIFICATIVES qui complètent les actes du bulletin.
 - Croise les informations entre les documents : si le bulletin a un acte "consultation" vide, mais qu'un reçu montre "Dr Driss, 50 DT, consultation", remplis l'acte avec ces infos.
 - Un praticien apparaît souvent sur plusieurs documents (bulletin + ordonnance + reçu). Unifie les informations.
+- ENRICHISSEMENT CROISÉ DES PRATICIENS : si un même médecin (même nom ou nom très similaire) apparaît dans plusieurs documents, COMBINE toutes les infos disponibles. Par exemple :
+  * Si le bulletin montre "Dr Ben Ali" sans matricule fiscale, mais qu'un reçu ou un cachet sur une ordonnance du même "Dr Ben Ali" montre le matricule fiscale → UTILISE ce matricule pour l'acte.
+  * Si la spécialité est visible sur un document mais pas sur un autre → prends-la du document où elle est visible.
+  * Le nom le plus complet doit être retenu (ex: "Dr Ben Ali" sur le bulletin mais "Dr Ben Ali Mohamed, Cardiologue" sur le reçu → garde la version complète).
+  * La correspondance entre praticiens se fait par le NOM (même si l'écriture varie légèrement entre les documents : "Dr BEN ALI" = "Dr ben ali" = "Dr Ben Ali M.").
 
 Retourne UNIQUEMENT ce JSON :
 
@@ -548,19 +577,34 @@ Retourne UNIQUEMENT ce JSON :
       "analyse": {
         "nom_laboratoire": "",
         "date": "",
+        "montant_total": "",
         "resultats": [
           {
             "nom": "",
+            "code_acte": "",
+            "cotation": "",
             "resultat": "",
-            "valeurs_normales": ""
+            "valeurs_normales": "",
+            "montant": "",
+            "montant_beneficiaire": ""
           }
         ]
+      },
+      "radiologie": {
+        "type_examen": "",
+        "centre": "",
+        "date": "",
+        "compte_rendu": "",
+        "montant": "",
+        "montant_beneficiaire": ""
       }
     }
   ],
   "total_dossier": {
     "total_honoraires": "",
     "total_pharmacie": "",
+    "total_analyses": "",
+    "total_radiologie": "",
     "total_general": ""
   }
 }
@@ -570,22 +614,201 @@ RÈGLES :
 - "conjoint.nom_prenom" : remplis UNIQUEMENT si case "Conjoint" cochée. Le nom du malade se trouve dans la section praticien du bulletin OU sur les ordonnances/reçus.
 - "enfants" : remplis UNIQUEMENT si case "Enfant" cochée. Sinon tableau vide [].
 - Chaque acte = un soin distinct. Si le bulletin montre une ligne "consultation" et qu'une ordonnance du même médecin existe → c'est le MÊME acte, mets l'ordonnance DANS cet acte.
-- "ordonnance", "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si un document correspondant existe dans les images. Si pas de document → ne mets pas la clé.
-- NE JAMAIS inventer de données. Si pas visible → "".
-- NE JAMAIS mettre "illisible" partout. Si un champ n'est vraiment pas lisible, mets "". Réserve "illisible" UNIQUEMENT pour les champs où tu vois du texte mais ne peux pas le déchiffrer.
+- "ordonnance", "pharmacie", "analyse", "radiologie" : remplis ces sous-objets UNIQUEMENT si un document correspondant existe dans les images. Si pas de document → ne mets pas la clé.
+- TAMPONS/CACHETS : les tampons sont IMPRIMÉS et donc plus fiables que le manuscrit. Extrais systématiquement : nom complet, spécialité, adresse, téléphone, matricule fiscale, numéro d'inscription à l'ordre. Les infos du tampon complètent ou corrigent le manuscrit.
+- NE JAMAIS inventer de données. Si un champ n'existe PAS du tout sur le document → "".
+- NE JAMAIS mettre "illisible" partout. Réserve "illisible" UNIQUEMENT pour les champs où tu vois du texte mais ne peux pas le déchiffrer.
 - Les noms sont tunisiens. Mêmes règles de correction : "nekk" → "Mekki", "nohaned" → "Mohamed".
 - "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
 - "type_soin" : ${TYPES_SOINS_TUNISIE.join(", ")}.
 
+RÈGLE CRITIQUE - MONTANTS ET PRIX :
+- Les montants (honoraires, prix médicaments, total pharmacie, total analyses) sont des informations ESSENTIELLES. Fais un effort maximal pour les lire.
+- Sur les reçus et factures de pharmacie, les prix sont souvent IMPRIMÉS (pas manuscrits) → ils sont lisibles. Cherche les colonnes "Prix", "Montant", "PU", "Total", "TTC".
+- Sur le bulletin de soins, les montants sont souvent MANUSCRITS. Attention aux chiffres ambigus : 0/6, 1/7, 5/8, 3/8. Lis attentivement.
+- Format attendu : nombre avec virgule ou point décimal (ex: "45.000", "120,500", "35 DT", "50.00"). Garde le format tel qu'il apparaît sur le document.
+- Si un montant est VISIBLE (même partiellement lisible), extrais-le. Ne mets "" que si le champ montant est vraiment ABSENT du document.
+- Sur les résultats d'analyse biologique, cherche le prix/montant total de l'analyse (souvent en bas de la feuille de résultats ou sur la facture du laboratoire).
+- CROISEMENT DES MONTANTS : si le bulletin montre un montant vide pour un acte, mais qu'un reçu du même praticien montre le montant → UTILISE le montant du reçu.
+
+RÈGLE CRITIQUE - RÉSULTATS D'ANALYSE BIOLOGIQUE :
+- Pour chaque ligne d'analyse, tu DOIS extraire la VALEUR du résultat ("resultat") et la plage de référence ("valeurs_normales").
+- "resultat" : la valeur numérique ou textuelle (ex: "0.95 g/l", "12.5", "Négatif"). JAMAIS vide si une valeur est visible.
+- "valeurs_normales" : la plage de référence (ex: "0.70 - 1.10 g/l"). JAMAIS vide si des valeurs de référence sont visibles.
+- Lis CHAQUE LIGNE du tableau de résultats attentivement. Les résultats sont dans une colonne à droite du nom du test.
+- Ne confonds pas le code de l'acte (ex: "BKA000010") avec le nom du test.
+
 ÉTAPE 1 : Identifie chaque image (bulletin, ordonnance, reçu, analyse...).
 ÉTAPE 2 : Extrais l'adhérent depuis le bulletin.
-ÉTAPE 3 : Pour chaque acte du bulletin, cherche dans les AUTRES images les documents qui correspondent (même médecin, même date, même patient) et intègre-les dans l'acte.`;
+ÉTAPE 3 : Construis un INDEX DES PRATICIENS en parcourant TOUS les documents. Pour chaque médecin, collecte toutes les infos trouvées (nom complet, spécialité, matricule fiscale) à travers tous les documents où il apparaît. Fusionne les infos pour avoir le profil le plus complet de chaque praticien.
+ÉTAPE 4 : Pour chaque acte du bulletin, cherche dans les AUTRES images les documents qui correspondent (même médecin, même date, même patient) et intègre-les dans l'acte. Utilise l'index des praticiens de l'ÉTAPE 3 pour compléter les champs manquants (matricule_fiscale, specialite, nom complet).`;
+
+// ─────────────────────────────────────────────
+// Prompt Phase 1 : extraction individuelle (1 image → 1 JSON)
+// ─────────────────────────────────────────────
+const PROMPT_EXTRACT_SINGLE = `Analyse cette image d'un document médical tunisien (BH Assurance).
+Identifie d'abord le TYPE de document : "bulletin", "recu", "ordonnance", "analyse", "note_honoraires", "facture_pharmacie", "radiologie", ou "autre".
+
+Retourne UNIQUEMENT ce JSON :
+{
+  "type_document": "",
+  "adherent": {
+    "nom_prenom": "",
+    "numero_contrat": "",
+    "numero_adherent": "",
+    "numero_bulletin": "",
+    "adresse": "",
+    "beneficiaire": "",
+    "conjoint": { "nom_prenom": "" },
+    "enfants": [{ "nom_prenom": "" }]
+  },
+  "actes": [
+    {
+      "type_soin": "",
+      "nature_acte": "",
+      "date_acte": "",
+      "praticien": {
+        "nom_prenom": "",
+        "specialite": "",
+        "matricule_fiscale": ""
+      },
+      "montant_honoraires": "",
+      "montant_facture": ""
+    }
+  ],
+  "ordonnance": {
+    "praticien": { "nom_prenom": "", "specialite": "", "matricule_fiscale": "" },
+    "medicaments": [{ "nom": "", "dosage": "", "posologie": "", "duree": "" }]
+  },
+  "pharmacie": {
+    "nom_pharmacie": "",
+    "date_achat": "",
+    "medicaments": [{ "nom": "", "quantite": "", "prix": "" }],
+    "total": ""
+  },
+  "analyse": {
+    "nom_laboratoire": "",
+    "date": "",
+    "montant_total": "",
+    "resultats": [{ "nom": "", "code_acte": "", "cotation": "", "resultat": "", "valeurs_normales": "", "montant": "", "montant_beneficiaire": "" }]
+  },
+  "radiologie": {
+    "type_examen": "",
+    "centre": "",
+    "date": "",
+    "compte_rendu": "",
+    "montant": "",
+    "montant_beneficiaire": ""
+  }
+}
+
+RÈGLES :
+- Remplis UNIQUEMENT les sections pertinentes pour ce type de document. Omets les sections non pertinentes.
+- NE JAMAIS inventer. Champ absent → "". Champ visible mais illisible → "illisible".
+- Les noms sont tunisiens. "nekk" → "Mekki", "nohaned" → "Mohamed".
+- "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
+- "type_soin" : ${TYPES_SOINS_TUNISIE.join(", ")}.
+
+RÈGLE ABSOLUE - EXTRACTION MAXIMALE :
+Tu DOIS extraire TOUTES les données visibles sur le document. Un champ vide "" signifie que l'information est ABSENTE du document, PAS que tu n'as pas fait l'effort de lire.
+
+- MONTANTS ET PRIX : effort maximal. Cherche "Prix", "Montant", "PU", "Total", "TTC". Ne mets "" que si le montant est réellement ABSENT.
+- MÉDICAMENTS (ordonnance) : pour chaque médicament, extrais le nom COMPLET (ex: "DOLIPRANE 1000mg", "AUGMENTIN 1g"), le dosage, la posologie (ex: "3x/jour", "1 cp matin et soir") et la durée. Lis chaque ligne de l'ordonnance attentivement.
+- MÉDICAMENTS (pharmacie/facture) : pour chaque ligne, extrais le nom du médicament, la quantité et le prix unitaire ou total. Les factures de pharmacie ont souvent un format tabulaire — lis chaque colonne.
+- RÉSULTATS D'ANALYSE : pour chaque test, extrais le nom du paramètre, la VALEUR du résultat (ex: "0.95 g/l", "12.5", "Négatif") et les valeurs normales/de référence. JAMAIS vide si visible.
+- PRATICIENS : extrais le nom complet, la spécialité et le matricule fiscale quand ils sont visibles.
+- Ne confonds pas les codes d'actes (ex: "BKA000010") avec les noms de tests.`;
+
+// ─────────────────────────────────────────────
+// Prompt Phase 2 : fusion des extractions (texte → JSON final)
+// ─────────────────────────────────────────────
+const PROMPT_FUSION = `Tu reçois les résultats d'extraction OCR de plusieurs documents du MÊME dossier médical d'un adhérent BH Assurance en Tunisie.
+Chaque document a été analysé séparément. Tu dois maintenant les FUSIONNER en un dossier unique et cohérent.
+
+IMPORTANT :
+- Le document de type "bulletin" est le document PRINCIPAL.
+- Les autres documents (reçus, ordonnances, analyses, factures) sont des PIÈCES JUSTIFICATIVES qui complètent les actes du bulletin.
+- ENRICHISSEMENT CROISÉ DES PRATICIENS : si un même médecin apparaît dans plusieurs documents, COMBINE toutes les infos (nom complet, spécialité, matricule fiscale). La version la plus complète gagne.
+- CROISEMENT DES MONTANTS : si le bulletin a un montant vide mais qu'un reçu du même praticien montre le montant → UTILISE-le.
+- Chaque acte = un soin distinct. Si le bulletin a un acte "consultation" et qu'une ordonnance du même médecin existe → intègre l'ordonnance DANS cet acte.
+
+Retourne UNIQUEMENT ce JSON :
+{
+  "adherent": {
+    "nom_prenom": "",
+    "numero_contrat": "",
+    "numero_adherent": "",
+    "numero_bulletin": "",
+    "adresse": "",
+    "beneficiaire": "adherent",
+    "conjoint": { "nom_prenom": "" },
+    "enfants": [{ "nom_prenom": "" }]
+  },
+  "actes": [
+    {
+      "type_soin": "",
+      "nature_acte": "",
+      "date_acte": "",
+      "praticien": {
+        "nom_prenom": "",
+        "specialite": "",
+        "matricule_fiscale": ""
+      },
+      "montant_honoraires": "",
+      "montant_facture": "",
+      "ordonnance": {
+        "medicaments": [{ "nom": "", "dosage": "", "posologie": "", "duree": "" }]
+      },
+      "pharmacie": {
+        "nom_pharmacie": "",
+        "date_achat": "",
+        "medicaments": [{ "nom": "", "quantite": "", "prix": "" }],
+        "total": ""
+      },
+      "analyse": {
+        "nom_laboratoire": "",
+        "date": "",
+        "montant_total": "",
+        "resultats": [{ "nom": "", "code_acte": "", "cotation": "", "resultat": "", "valeurs_normales": "", "montant": "", "montant_beneficiaire": "" }]
+      },
+      "radiologie": {
+        "type_examen": "",
+        "centre": "",
+        "date": "",
+        "compte_rendu": "",
+        "montant": "",
+        "montant_beneficiaire": ""
+      }
+    }
+  ],
+  "total_dossier": {
+    "total_honoraires": "",
+    "total_pharmacie": "",
+    "total_analyses": "",
+    "total_radiologie": "",
+    "total_general": ""
+  }
+}
+
+Voici les extractions individuelles :
+`;
 
 // ─────────────────────────────────────────────
 // POST /analyse-bulletin
 // 1 fichier  → prompt bulletin simple
-// N fichiers → prompt unifié qui croise toutes les images
+// 2-3 fichiers → prompt unifié (toutes les images ensemble)
+// 4+ fichiers → Phase 1 parallèle + Phase 2 fusion
 // ─────────────────────────────────────────────
+
+// Seuil à partir duquel on passe en mode parallèle (2 = dès 2 fichiers)
+const PARALLEL_THRESHOLD = 2;
+
+// Helper : parser la réponse Gemini en JSON
+function parseGeminiJSON(text) {
+  const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+  return JSON.parse(cleaned);
+}
+
 app.post("/analyse-bulletin", async (c) => {
   const startTime = Date.now();
   try {
@@ -596,26 +819,68 @@ app.post("/analyse-bulletin", async (c) => {
       return c.json({ error: "Aucun fichier envoyé" }, 422);
     }
 
-    // Convertir tous les fichiers en base64
-    const imageParts = await Promise.all(
-      files.map(async (file) => {
-        const base64 = await fileToBase64(file);
-        return { inlineData: { data: base64, mimeType: file.type || "image/jpeg" } };
-      })
-    );
-
-    // Choisir le prompt : simple pour 1 fichier, unifié pour plusieurs
-    const prompt = files.length === 1 ? PROMPT : PROMPT_DOSSIER;
-    const result = await generateWithFallback(c.env, [prompt, ...imageParts]);
-    const text = result.response.text();
-
     let data = null;
     let parseOk = false;
-    try {
-      const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-      data = JSON.parse(cleaned);
-      parseOk = true;
-    } catch { /* ignore */ }
+    let rawText = null;
+    let modelUsed = null;
+
+    if (files.length < PARALLEL_THRESHOLD) {
+      // ── Mode classique : toutes les images dans une seule requête ──
+      const imageParts = await Promise.all(
+        files.map(async (file) => {
+          const base64 = await fileToBase64(file);
+          return { inlineData: { data: base64, mimeType: file.type || "image/jpeg" } };
+        })
+      );
+
+      const prompt = files.length === 1 ? PROMPT : PROMPT_DOSSIER;
+      const result = await generateWithFallback(c.env, [prompt, ...imageParts]);
+      rawText = result.response.text();
+      modelUsed = result.modelUsed;
+
+      try {
+        data = parseGeminiJSON(rawText);
+        parseOk = true;
+      } catch { /* ignore */ }
+
+    } else {
+      // ── Mode parallèle : Phase 1 (extraction) + Phase 2 (fusion) ──
+
+      // Phase 1 : extraire chaque image en parallèle
+      const extractions = await Promise.all(
+        files.map(async (file, index) => {
+          try {
+            const base64 = await fileToBase64(file);
+            const imagePart = { inlineData: { data: base64, mimeType: file.type || "image/jpeg" } };
+            const result = await generateWithFallback(c.env, [PROMPT_EXTRACT_SINGLE, imagePart]);
+            const text = result.response.text();
+            return { index, success: true, data: parseGeminiJSON(text) };
+          } catch (err) {
+            return { index, success: false, error: err.message };
+          }
+        })
+      );
+
+      // Collecter les résultats réussis
+      const successful = extractions.filter((e) => e.success);
+
+      if (successful.length === 0) {
+        throw new Error("Aucune image n'a pu être analysée");
+      }
+
+      // Phase 2 : fusionner les extractions (requête texte uniquement, pas d'images)
+      const fusionInput = PROMPT_FUSION + successful
+        .map((e, i) => `\n--- Document ${i + 1} (${e.data.type_document || "inconnu"}) ---\n${JSON.stringify(e.data, null, 2)}`)
+        .join("\n");
+
+      const fusionResult = await generateWithFallback(c.env, [fusionInput]);
+      rawText = fusionResult.response.text();
+
+      try {
+        data = parseGeminiJSON(rawText);
+        parseOk = true;
+      } catch { /* ignore */ }
+    }
 
     // Log d'utilisation
     if (c.env.DB) {
@@ -631,8 +896,9 @@ app.post("/analyse-bulletin", async (c) => {
     return c.json({
       success: true,
       nombre_fichiers: files.length,
+      mode: files.length >= PARALLEL_THRESHOLD ? "parallele" : "unifie",
       resultat: data,
-      ...(parseOk ? {} : { reponse_brute: text, avertissement: "La réponse n'a pas pu être parsée en JSON structuré." }),
+      ...(parseOk ? {} : { reponse_brute: rawText, avertissement: "La réponse n'a pas pu être parsée en JSON structuré." }),
     });
 
   } catch (err) {
