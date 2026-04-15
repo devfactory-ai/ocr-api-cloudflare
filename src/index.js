@@ -257,9 +257,7 @@ async function fileToBase64(file) {
 
 // Modèles Gemini par ordre de préférence
 const GEMINI_MODELS = [
-  "gemini-3.1-flash-lite-preview",
-  "gemini-2.0-flash",
-  "gemini-2.5-flash",
+  "gemini-3.1-pro"
 ];
 
 // Helper: générer du contenu avec fallback automatique entre modèles
@@ -719,6 +717,51 @@ app.post("/ocr", async (c) => {
     }, 500);
   }
 });
+app.post('/upload', async (c) => {
+  try {
+    // 1. Récupérer le body avec l'option { all: true } 
+    // Cela permet de recevoir un tableau si plusieurs fichiers ont le même nom de champ
+    const body = await c.req.parseBody({ all: true })
+    
+    // On récupère le champ "images" (assurez-vous que le client utilise ce nom)
+    const files = body['images']
+
+    if (!files) {
+      return c.json({ error: "Aucun fichier trouvé" }, 400)
+    }
+
+    // 2. Transformer en tableau si ce n'est pas déjà le cas (cas d'un seul fichier)
+    const fileArray = Array.isArray(files) ? files : [files]
+    
+    const results = []
+
+    // 3. Boucler sur chaque image
+    for (const file of fileArray) {
+      if (file instanceof File) {
+        // Convertir le fichier en buffer/base64 pour l'OCR
+        const arrayBuffer = await file.arrayBuffer()
+        
+        // --- LOGIQUE OCR ICI ---
+        // Exemple : const text = await runOCR(arrayBuffer)
+        
+        results.push({
+          filename: file.name,
+          status: "processed",
+          // data: text 
+        })
+      }
+    }
+
+    return c.json({
+      message: "Traitement terminé",
+      count: results.length,
+      details: results
+    })
+
+  } catch (error) {
+    return c.json({ error: error.message }, 500)
+  }
+})
 
 /* ============================================================
    GEMINI VERSION (commentée) - Décommenter pour utiliser Gemini
