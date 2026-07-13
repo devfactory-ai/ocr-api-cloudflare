@@ -97,6 +97,18 @@ Extrais avec précision TOUTES les informations visibles.
    - Extrais les totaux : total dépensé et total remboursé.
 8. CROISEMENT CNAM ↔ ACTES : Si un décompte CNAM est présent, pour chaque acte dans "actes_independants", cherche la ligne CNAM correspondante (même type de soin, même date, même montant dépensé) et remplis le champ "montant_cnam" avec le montant remboursé CNAM correspondant. Si aucune correspondance → "montant_cnam": "".
 
+🟢 EXTRACTION DES PIÈCES JUSTIFICATIVES (Ordonnances, Bilans, Reçus, etc.) :
+9. Pour chaque document justificatif présent dans les images, extrais ses informations dans le tableau "pieces_justificatives".
+   - Types de pièces à détecter :
+     * "ORDONNANCE" : prescription médicale (médicaments prescrits, posologie, durée, médecin prescripteur)
+     * "BILAN" : résultat d'analyse biologique / bilan sanguin / bilan médical (paramètres, valeurs, unités, normes)
+     * "RECU" : reçu de paiement, ticket de caisse, quittance (montant payé, prestataire, date)
+     * "FACTURE" : facture détaillée de pharmacie, labo, clinique (lignes, montants, TVA)
+     * "COMPTE_RENDU" : compte-rendu médical, rapport radiologique, certificat médical
+     * "AUTRE" : tout autre document justificatif non classifiable
+   - Chaque pièce doit être rattachée à l'acte correspondant dans "actes_independants" via le champ "rattachement_acte" (index de l'acte dans le tableau, commençant à 0). Si aucun rattachement possible → null.
+10. CROISEMENT ORDONNANCES ↔ PHARMACIE : Si une ordonnance prescrit des médicaments et qu'un ticket de pharmacie les liste, vérifie la cohérence : les médicaments délivrés correspondent-ils à la prescription ? Signale les écarts dans "observations".
+
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 
 {
@@ -186,6 +198,35 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
             "total_depense": "Total dépensé (toutes sections)",
             "total_rembourse": "Total remboursé par la CNAM (toutes sections)"
           },
+          "pieces_justificatives": [
+            {
+              "type_piece": "ORDONNANCE | BILAN | RECU | FACTURE | COMPTE_RENDU | AUTRE",
+              "rattachement_acte": 0,
+              "praticien": "Nom du médecin/prescripteur",
+              "date": "Date du document (JJ/MM/AAAA)",
+              "contenu": {
+                "medicaments_prescrits": [
+                  {
+                    "nom": "Nom du médicament",
+                    "posologie": "Posologie prescrite",
+                    "duree": "Durée du traitement",
+                    "quantite": "Quantité prescrite"
+                  }
+                ],
+                "resultats_bilan": [
+                  {
+                    "parametre": "Nom du paramètre (ex: Glycémie, Cholestérol...)",
+                    "valeur": "Valeur mesurée",
+                    "unite": "Unité (g/l, mmol/l...)",
+                    "norme": "Valeurs normales de référence"
+                  }
+                ],
+                "texte_libre": "Contenu textuel pour COMPTE_RENDU ou AUTRE (résumé fidèle)"
+              },
+              "montant": "Montant figurant sur la pièce (si applicable)",
+              "observations": "Remarques : écarts ordonnance/pharmacie, anomalies détectées"
+            }
+          ],
           "synthese": {
             "total_medecin": "Somme Consultations ou 0",
             "total_radiologie": "Somme Actes Radio/Imagerie ou 0",
@@ -204,6 +245,7 @@ RÈGLES :
 - Chaque acte = un soin distinct.
 - "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si les données correspondantes existent sur le document. Si pas de données → ne mets pas la clé.
 - "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM (décompte de remboursement) est présent dans les images. Si aucun document CNAM → ne mets pas la clé "cnam".
+- "pieces_justificatives" : remplis ce tableau UNIQUEMENT si des documents justificatifs (ordonnances, bilans, reçus, factures, comptes-rendus) sont présents dans les images. Si aucun → tableau vide []. Dans "contenu", remplis UNIQUEMENT les sous-clés pertinentes au type de pièce : "medicaments_prescrits" pour ORDONNANCE, "resultats_bilan" pour BILAN, "texte_libre" pour COMPTE_RENDU/AUTRE. Supprime les sous-clés non pertinentes.
 - NE JAMAIS inventer de données. Si pas visible → "".
 - Les noms sont tunisiens. "nekk" → "Mekki", "nohaned" → "Mohamed".
 - "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
@@ -234,6 +276,18 @@ Tu dois COMBINER toutes ces images pour produire UN SEUL dossier structuré et c
    - Pour chaque ligne, extrais : code (si dispo), désignation, quantité (si dispo), date, montant dépensé, montant remboursé, décision médicale.
    - Extrais les totaux : total dépensé et total remboursé.
 8. CROISEMENT CNAM ↔ ACTES : Si un décompte CNAM est présent, pour chaque acte dans "actes_independants", cherche la ligne CNAM correspondante (même type de soin, même date, même montant dépensé) et remplis le champ "montant_cnam" avec le montant remboursé CNAM correspondant. Si aucune correspondance → "montant_cnam": "".
+
+🟢 EXTRACTION DES PIÈCES JUSTIFICATIVES (Ordonnances, Bilans, Reçus, etc.) :
+9. Pour chaque document justificatif présent dans les images, extrais ses informations dans le tableau "pieces_justificatives".
+   - Types de pièces à détecter :
+     * "ORDONNANCE" : prescription médicale (médicaments prescrits, posologie, durée, médecin prescripteur)
+     * "BILAN" : résultat d'analyse biologique / bilan sanguin / bilan médical (paramètres, valeurs, unités, normes)
+     * "RECU" : reçu de paiement, ticket de caisse, quittance (montant payé, prestataire, date)
+     * "FACTURE" : facture détaillée de pharmacie, labo, clinique (lignes, montants, TVA)
+     * "COMPTE_RENDU" : compte-rendu médical, rapport radiologique, certificat médical
+     * "AUTRE" : tout autre document justificatif non classifiable
+   - Chaque pièce doit être rattachée à l'acte correspondant dans "actes_independants" via le champ "rattachement_acte" (index de l'acte dans le tableau, commençant à 0). Si aucun rattachement possible → null.
+10. CROISEMENT ORDONNANCES ↔ PHARMACIE : Si une ordonnance prescrit des médicaments et qu'un ticket de pharmacie les liste, vérifie la cohérence : les médicaments délivrés correspondent-ils à la prescription ? Signale les écarts dans "observations".
 
 IMPORTANT :
 - Le bulletin de soins est le document PRINCIPAL (il a un numéro de bulletin imprimé).
@@ -331,6 +385,35 @@ Retourne UNIQUEMENT ce JSON :
             "total_depense": "Total dépensé (toutes sections)",
             "total_rembourse": "Total remboursé par la CNAM (toutes sections)"
           },
+          "pieces_justificatives": [
+            {
+              "type_piece": "ORDONNANCE | BILAN | RECU | FACTURE | COMPTE_RENDU | AUTRE",
+              "rattachement_acte": 0,
+              "praticien": "Nom du médecin/prescripteur",
+              "date": "Date du document (JJ/MM/AAAA)",
+              "contenu": {
+                "medicaments_prescrits": [
+                  {
+                    "nom": "Nom du médicament",
+                    "posologie": "Posologie prescrite",
+                    "duree": "Durée du traitement",
+                    "quantite": "Quantité prescrite"
+                  }
+                ],
+                "resultats_bilan": [
+                  {
+                    "parametre": "Nom du paramètre (ex: Glycémie, Cholestérol...)",
+                    "valeur": "Valeur mesurée",
+                    "unite": "Unité (g/l, mmol/l...)",
+                    "norme": "Valeurs normales de référence"
+                  }
+                ],
+                "texte_libre": "Contenu textuel pour COMPTE_RENDU ou AUTRE (résumé fidèle)"
+              },
+              "montant": "Montant figurant sur la pièce (si applicable)",
+              "observations": "Remarques : écarts ordonnance/pharmacie, anomalies détectées"
+            }
+          ],
           "synthese": {
             "total_medecin": "Somme Consultations ou 0",
             "total_radiologie": "Somme Actes Radio/Imagerie ou 0",
@@ -349,14 +432,16 @@ RÈGLES :
 - Chaque acte = un soin distinct. Si le bulletin montre une ligne "consultation" et qu'une ordonnance du même médecin existe → c'est le MÊME acte, mets l'ordonnance DANS cet acte.
 - "ordonnance", "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si un document correspondant existe dans les images. Si pas de document → ne mets pas la clé.
 - "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM (décompte de remboursement) est présent dans les images. Si aucun document CNAM → ne mets pas la clé "cnam".
+- "pieces_justificatives" : remplis ce tableau UNIQUEMENT si des documents justificatifs (ordonnances, bilans, reçus, factures, comptes-rendus) sont présents dans les images. Si aucun → tableau vide []. Dans "contenu", remplis UNIQUEMENT les sous-clés pertinentes au type de pièce : "medicaments_prescrits" pour ORDONNANCE, "resultats_bilan" pour BILAN, "texte_libre" pour COMPTE_RENDU/AUTRE. Supprime les sous-clés non pertinentes.
 - NE JAMAIS inventer de données. Si pas visible → "".
 - Les noms sont tunisiens. "nekk" → "Mekki", "nohaned" → "Mohamed".
 - "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
 
-ÉTAPE 1 : Identifie chaque image (bulletin, ordonnance, reçu, analyse, décompte CNAM...).
+ÉTAPE 1 : Identifie chaque image (bulletin, ordonnance, reçu, bilan, facture, compte-rendu, décompte CNAM...).
 ÉTAPE 2 : Extrais l'adhérent depuis le bulletin.
 ÉTAPE 3 : Pour chaque acte du bulletin, cherche dans les AUTRES images les documents qui correspondent (même médecin, même date, même patient) et intègre-les dans l'acte.
 ÉTAPE 4 : Si un décompte CNAM est présent, extrais ses données dans le bloc "cnam" et croise les montants remboursés avec les actes correspondants (montant_cnam).
+ÉTAPE 5 : Pour chaque pièce justificative (ordonnance, bilan, reçu, facture, compte-rendu), extrais ses données dans "pieces_justificatives" et rattache-la à l'acte correspondant. Vérifie la cohérence ordonnance/pharmacie.
 Si des champs sont introuvables (même après croisement), indique "". N'ajoute pas de balises de code Markdown.`;
 
 // ─────────────────────────────────────────────
