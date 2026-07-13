@@ -88,9 +88,18 @@ Extrais avec précision TOUTES les informations visibles.
 5. REGROUPEMENT OBLIGATOIRE : Pour les actes de type "pharmacie" et "analyse biologique", regroupe TOUTES les lignes (médicaments ou analyses) d'un MÊME acte (même date, même pharmacie/labo) dans UN SEUL objet avec un tableau "details_lignes". Ne crée PAS un acte séparé par médicament ou par analyse.
 6. ULTIME RECOURS : Si le manuscrit est indéchiffrable et sans référence imprimée sur un autre document, utilise la mention "[ILLISIBLE]". AUCUNE INVENTION.
 
+🔵 DÉTECTION ET EXTRACTION DU DOCUMENT CNAM :
+7. Si un document CNAM est présent (Décompte de remboursement des frais de soins de la Caisse Nationale d'Assurance Maladie), tu DOIS l'analyser et remplir le bloc "cnam" ci-dessous.
+   - Le document CNAM peut se présenter sous différents formats : décompte imprimé, relevé de remboursement, bordereau CNAM, attestation de prise en charge, etc.
+   - Identifie-le par les mots-clés : "CNAM", "Caisse Nationale d'Assurance Maladie", "Décompte de remboursement", "Mnt Remb", "Mnt à remb", "Total remboursé".
+   - Extrais TOUTES les sections du décompte CNAM : Consultation & Visites, Actes, Médicaments, ou toute autre section présente.
+   - Pour chaque ligne, extrais : désignation, date, montant dépensé, montant remboursé, décision médicale.
+   - Extrais les totaux : total dépensé et total remboursé.
+8. CROISEMENT CNAM ↔ ACTES : Si un décompte CNAM est présent, pour chaque acte dans "actes_independants", cherche la ligne CNAM correspondante (même type de soin, même date, même montant dépensé) et remplis le champ "montant_cnam" avec le montant remboursé CNAM correspondant. Si aucune correspondance → "montant_cnam": "".
+
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 
-{        {
+{
           "infos_adherent": {
             "nom_prenom": "Nom de l'adhérent",
             "numero_adherent": "N° de l'adhérent",
@@ -108,7 +117,8 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
               "praticien": "Nom du médecin traitant",
               "matricule_fiscale": "...",
               "acte": "Nature (Consultation / Visite)",
-              "montant": "..."
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             },
             {
               "type": "RADIOLOGIE",
@@ -117,7 +127,8 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
               "matricule_fiscale": "...",
               "medecin_prescripteur": "Médecin ayant prescrit la radio",
               "acte": "Ex: Echographie abdominale, Radiographie...",
-              "montant": "..."
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             },
             {
               "type": "PHARMACIE",
@@ -128,7 +139,8 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
               "code_amm": "...",
               "quantite": "...",
               "prix_unitaire": "...",
-              "total_ligne": "..."
+              "total_ligne": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             },
            {
               "type": "LABORATOIRE",
@@ -144,15 +156,43 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
                   "montant": "Montant de cette ligne"
                 }
               ],
-              "montant": "Montant Total facturé pour cet acte labo"
+              "montant": "Montant Total facturé pour cet acte labo",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             }
           ],
+          "cnam": {
+            "numero_assure": "N° de l'assuré CNAM",
+            "caisse": "Nom de la caisse (ex: CNSS, CNRPS...)",
+            "beneficiaire": "Bénéficiaire (ex: Conjoint - SAMIA, Adhérent...)",
+            "regime": "Régime (ex: APCI/MLD, AMG...)",
+            "ref_paiement": "Référence de paiement / Mandat",
+            "date_decompte": "Date du décompte (JJ/MM/AAAA)",
+            "details_remboursement": [
+              {
+                "categorie": "Consultation & Visites | Actes | Médicaments | autre section",
+                "lignes": [
+                  {
+                    "code": "Code du produit/acte (si disponible)",
+                    "designation": "Désignation de l'acte ou du médicament",
+                    "quantite": "Quantité (si disponible)",
+                    "date": "Date de l'acte",
+                    "montant_depense": "Montant dépensé",
+                    "montant_rembourse": "Montant remboursé par la CNAM",
+                    "decision": "Décision médicale (Accord, Rejet, etc.)"
+                  }
+                ]
+              }
+            ],
+            "total_depense": "Total dépensé (toutes sections)",
+            "total_rembourse": "Total remboursé par la CNAM (toutes sections)"
+          },
           "synthese": {
             "total_medecin": "Somme Consultations ou 0",
             "total_radiologie": "Somme Actes Radio/Imagerie ou 0",
             "total_pharmacie": "Somme pharmacie ou 0",
             "total_laboratoire": "Total labo ou 0",
             "total_global_calcule": "La somme de tout le dossier",
+            "total_cnam": "Total remboursé par la CNAM (depuis le décompte CNAM si présent, sinon 0)",
             "devise": "DT"
           }
         }
@@ -163,6 +203,7 @@ RÈGLES :
 - "enfants" : remplis UNIQUEMENT si case "Enfant" cochée. Sinon tableau vide [].
 - Chaque acte = un soin distinct.
 - "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si les données correspondantes existent sur le document. Si pas de données → ne mets pas la clé.
+- "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM (décompte de remboursement) est présent dans les images. Si aucun document CNAM → ne mets pas la clé "cnam".
 - NE JAMAIS inventer de données. Si pas visible → "".
 - Les noms sont tunisiens. "nekk" → "Mekki", "nohaned" → "Mohamed".
 - "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
@@ -173,7 +214,7 @@ Si des champs sont introuvables, indique "". N'ajoute pas de balises de code Mar
 // Utilisé quand plusieurs fichiers sont envoyés
 // ─────────────────────────────────────────────
 const PROMPT_DOSSIER = `Tu reçois plusieurs images qui font partie du MÊME dossier médical d'un adhérent BH Assurance en Tunisie.
-Ces images peuvent inclure : un bulletin de soins, des reçus, des ordonnances, des résultats d'analyse, des factures, etc.
+Ces images peuvent inclure : un bulletin de soins, des reçus, des ordonnances, des résultats d'analyse, des factures, un décompte CNAM, etc.
 
 Tu dois COMBINER toutes ces images pour produire UN SEUL dossier structuré et complet.
 
@@ -185,11 +226,21 @@ Tu dois COMBINER toutes ces images pour produire UN SEUL dossier structuré et c
 5. REGROUPEMENT OBLIGATOIRE : Pour PHARMACIE et LABORATOIRE, regroupe TOUTES les lignes (médicaments ou analyses) d'un MÊME acte (même date, même pharmacie/labo) dans UN SEUL objet avec un tableau "details_lignes". Ne crée PAS un objet séparé par médicament ou par analyse.
 6. ULTIME RECOURS : Si le manuscrit est indéchiffrable et sans référence imprimée sur un autre document, utilise la mention "[ILLISIBLE]". AUCUNE INVENTION.
 
+🔵 DÉTECTION ET EXTRACTION DU DOCUMENT CNAM :
+7. Si un document CNAM est présent parmi les images (Décompte de remboursement des frais de soins de la Caisse Nationale d'Assurance Maladie), tu DOIS l'analyser et remplir le bloc "cnam" ci-dessous.
+   - Le document CNAM peut se présenter sous différents formats : décompte imprimé, relevé de remboursement, bordereau CNAM, attestation de prise en charge, notification de remboursement, etc.
+   - Identifie-le par les mots-clés : "CNAM", "Caisse Nationale d'Assurance Maladie", "Décompte de remboursement", "Mnt Remb", "Mnt à remb", "Total remboursé", "TotRemb".
+   - Extrais TOUTES les sections du décompte CNAM : Consultation & Visites, Actes, Médicaments, ou toute autre section présente sur le document.
+   - Pour chaque ligne, extrais : code (si dispo), désignation, quantité (si dispo), date, montant dépensé, montant remboursé, décision médicale.
+   - Extrais les totaux : total dépensé et total remboursé.
+8. CROISEMENT CNAM ↔ ACTES : Si un décompte CNAM est présent, pour chaque acte dans "actes_independants", cherche la ligne CNAM correspondante (même type de soin, même date, même montant dépensé) et remplis le champ "montant_cnam" avec le montant remboursé CNAM correspondant. Si aucune correspondance → "montant_cnam": "".
+
 IMPORTANT :
 - Le bulletin de soins est le document PRINCIPAL (il a un numéro de bulletin imprimé).
-- Les autres documents (reçus, ordonnances, analyses) sont des PIÈCES JUSTIFICATIVES qui complètent les actes du bulletin.
+- Les autres documents (reçus, ordonnances, analyses, décompte CNAM) sont des PIÈCES JUSTIFICATIVES qui complètent les actes du bulletin.
 - Croise les informations entre les documents : si le bulletin a un acte "consultation" vide, mais qu'un reçu montre "Dr Driss, 50 DT, consultation", remplis l'acte avec ces infos.
 - Un praticien apparaît souvent sur plusieurs documents (bulletin + ordonnance + reçu). Unifie les informations.
+- Le décompte CNAM est une source FIABLE pour les montants remboursés. Utilise-le pour alimenter automatiquement les champs "montant_cnam".
 
 Retourne UNIQUEMENT ce JSON :
 
@@ -211,7 +262,8 @@ Retourne UNIQUEMENT ce JSON :
               "praticien": "Nom du médecin traitant",
               "matricule_fiscale": "...",
               "acte": "Nature (Consultation / Visite)",
-              "montant": "..."
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             },
             {
               "type": "RADIOLOGIE",
@@ -220,7 +272,8 @@ Retourne UNIQUEMENT ce JSON :
               "matricule_fiscale": "...",
               "medecin_prescripteur": "Médecin ayant prescrit la radio",
               "acte": "Ex: Echographie abdominale, Radiographie...",
-              "montant": "..."
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             },
             {
               "type": "PHARMACIE",
@@ -231,7 +284,8 @@ Retourne UNIQUEMENT ce JSON :
               "code_amm": "...",
               "quantite": "...",
               "prix_unitaire": "...",
-              "total_ligne": "..."
+              "total_ligne": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             },
            {
               "type": "LABORATOIRE",
@@ -247,15 +301,43 @@ Retourne UNIQUEMENT ce JSON :
                   "montant": "Montant de cette ligne"
                 }
               ],
-              "montant": "Montant Total facturé pour cet acte labo"
+              "montant": "Montant Total facturé pour cet acte labo",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
             }
           ],
+          "cnam": {
+            "numero_assure": "N° de l'assuré CNAM",
+            "caisse": "Nom de la caisse (ex: CNSS, CNRPS...)",
+            "beneficiaire": "Bénéficiaire (ex: Conjoint - SAMIA, Adhérent...)",
+            "regime": "Régime (ex: APCI/MLD, AMG...)",
+            "ref_paiement": "Référence de paiement / Mandat",
+            "date_decompte": "Date du décompte (JJ/MM/AAAA)",
+            "details_remboursement": [
+              {
+                "categorie": "Consultation & Visites | Actes | Médicaments | autre section",
+                "lignes": [
+                  {
+                    "code": "Code du produit/acte (si disponible)",
+                    "designation": "Désignation de l'acte ou du médicament",
+                    "quantite": "Quantité (si disponible)",
+                    "date": "Date de l'acte",
+                    "montant_depense": "Montant dépensé",
+                    "montant_rembourse": "Montant remboursé par la CNAM",
+                    "decision": "Décision médicale (Accord, Rejet, etc.)"
+                  }
+                ]
+              }
+            ],
+            "total_depense": "Total dépensé (toutes sections)",
+            "total_rembourse": "Total remboursé par la CNAM (toutes sections)"
+          },
           "synthese": {
             "total_medecin": "Somme Consultations ou 0",
             "total_radiologie": "Somme Actes Radio/Imagerie ou 0",
             "total_pharmacie": "Somme pharmacie ou 0",
             "total_laboratoire": "Total labo ou 0",
             "total_global_calcule": "La somme de tout le dossier",
+            "total_cnam": "Total remboursé par la CNAM (depuis le décompte CNAM si présent, sinon 0)",
             "devise": "DT"
           }
         }
@@ -266,13 +348,15 @@ RÈGLES :
 - "enfants" : remplis UNIQUEMENT si case "Enfant" cochée. Sinon tableau vide [].
 - Chaque acte = un soin distinct. Si le bulletin montre une ligne "consultation" et qu'une ordonnance du même médecin existe → c'est le MÊME acte, mets l'ordonnance DANS cet acte.
 - "ordonnance", "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si un document correspondant existe dans les images. Si pas de document → ne mets pas la clé.
+- "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM (décompte de remboursement) est présent dans les images. Si aucun document CNAM → ne mets pas la clé "cnam".
 - NE JAMAIS inventer de données. Si pas visible → "".
 - Les noms sont tunisiens. "nekk" → "Mekki", "nohaned" → "Mohamed".
 - "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
 
-ÉTAPE 1 : Identifie chaque image (bulletin, ordonnance, reçu, analyse...).
+ÉTAPE 1 : Identifie chaque image (bulletin, ordonnance, reçu, analyse, décompte CNAM...).
 ÉTAPE 2 : Extrais l'adhérent depuis le bulletin.
 ÉTAPE 3 : Pour chaque acte du bulletin, cherche dans les AUTRES images les documents qui correspondent (même médecin, même date, même patient) et intègre-les dans l'acte.
+ÉTAPE 4 : Si un décompte CNAM est présent, extrais ses données dans le bloc "cnam" et croise les montants remboursés avec les actes correspondants (montant_cnam).
 Si des champs sont introuvables (même après croisement), indique "". N'ajoute pas de balises de code Markdown.`;
 
 // ─────────────────────────────────────────────
