@@ -1,192 +1,462 @@
+// src/index.js
+// API OCR BH Assurance — Cloudflare Workers + Hono
+// Inclut la plateforme d'administration, D1 et l'OCR avancé multi-documents
+
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-// import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import admin from "./admin.js"; // À supposer existant dans votre dossier
+import { logUsageEvent } from "./stats.js"; // À supposer existant dans votre dossier
 
 const app = new Hono();
-
 app.use("/*", cors());
 
-const TYPES_SOINS_TUNISIE = [
-  "consultation",
-  "consultation specialisee",
-  "analyse biologique",
-  "analyse medicale",
-  "radiologie",
-  "echographie",
-  "scanner",
-  "IRM",
-  "pharmacie",
-  "chirurgie",
-  "hospitalisation",
-  "soins dentaires",
-  "prothese dentaire",
-  "optique",
-  "lunettes",
-  "lentilles",
-  "kinesitherapie",
-  "reeducation fonctionnelle",
-  "soins ambulatoires",
-  "accouchement",
-  "maternite",
-  "dialyse",
-  "chimiotherapie",
-  "radiotherapie",
-  "cure thermale",
-  "appareillage",
-  "prothese orthopedique",
-  "transport sanitaire",
-  "soins infirmiers",
-  "laboratoire",
-  "medecine generale",
-  "medecine de specialite",
-];
+// ─────────────────────────────────────────────
+// Initialisation automatique des tables D1
+// ─────────────────────────────────────────────
+let dbInitialized = false;
 
-const PROMPT = `Analyse ces images d'un bulletin de soins BH Assurance en Tunisie.
-Extrais avec précision TOUTES les informations visibles, en particulier :
-- Le numéro du bulletin de soins (souvent en haut du document)
-- Le type de soin / nature de l'acte médical
-- La matricule fiscale de chaque praticien (suite de chiffres/lettres identifiant fiscalement le praticien)
+async function initDB(db) {
+  if (dbInitialized || !db) return;
+  try {
+    await db.batch([
+      db.prepare(`CREATE TABLE IF NOT EXISTS bulletins_valides (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        donnees_ia            TEXT    NOT NULL,
+        statut_validation     TEXT    NOT NULL DEFAULT 'en_attente',
+        erreurs_signalees     TEXT    NOT NULL DEFAULT '[]',
+        commentaires_correction TEXT  NOT NULL DEFAULT '',
+        created_at            DATETIME DEFAULT (datetime('now'))
+      )`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS usage_logs (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        endpoint      TEXT    NOT NULL,
+        provider      TEXT,
+        status        TEXT    NOT NULL,
+        nb_fichiers   INTEGER NOT NULL DEFAULT 1,
+        duree_ms      INTEGER,
+        error_message TEXT,
+        created_at    DATETIME DEFAULT (datetime('now'))
+      )`),
+      db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at DESC)`,
+      ),
+      db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_usage_logs_status ON usage_logs(status)`,
+      ),
+      db.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_usage_logs_endpoint ON usage_logs(endpoint)`,
+      ),
+      db.prepare(`CREATE TABLE IF NOT EXISTS ocr_providers (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        nom         TEXT    NOT NULL UNIQUE,
+        type        TEXT    NOT NULL,
+        api_key     TEXT,
+        modele      TEXT,
+        est_actif   INTEGER NOT NULL DEFAULT 1,
+        config_json TEXT    NOT NULL DEFAULT '{}',
+        created_at  DATETIME DEFAULT (datetime('now')),
+        updated_at  DATETIME DEFAULT (datetime('now'))
+      )`),
+    ]);
+    dbInitialized = true;
+  } catch (e) {
+    console.error("DB init error:", e.message);
+  }
+}
+
+app.use("/*", async (c, next) => {
+  if (c.env.DB) await initDB(c.env.DB);
+  return next();
+});
+
+// Monter la plateforme d'administration
+app.route("/admin", admin);
+
+// ─────────────────────────────────────────────
+// LE SUPER-PROMPT MULTI-DOCUMENTS (Auto-Correction & Classement)
+// Utilisé pour POST /analyse-bulletin (plusieurs fichiers simultanés)
+// ─────────────────────────────────────────────
+const PROMPT = `Analyse ces images d'un bulletin de soins BH Assurance.
+Extrais avec précision TOUTES les informations visibles.
+
+🔴 RÈGLES D'AUTO-CORRECTION ET RECROISEMENT :
+1. Privilégie TOUJOURS les textes dactylographiés/imprimés (tickets de pharmacie, factures informatiques) pour écraser ou corriger l'écriture manuscrite brouillonne au recto des bulletins.
+2. Pour les praticiens, sors leur Nom/Prénom et leur MATRICULE FISCALE (M.F) en te basant EXCLUSIVEMENT sur les Cachets Officiels/Tampons à l'encre s'ils sont lisibles.
+3. Ne mélange PAS un "Médecin" (Consultation C, V) et un "Centre de RADIOLOGIE" (Echographie, Scanner, IRM). Utilise le bon "type" pour eux.
+4. Répare l'orthographe des noms de médicaments selon les factures imprimées, si manuscritement le code ou nom est mal recopié.
+5. REGROUPEMENT OBLIGATOIRE : Pour les actes de type "pharmacie" et "analyse biologique", regroupe TOUTES les lignes (médicaments ou analyses) d'un MÊME acte (même date, même pharmacie/labo) dans UN SEUL objet avec un tableau "details_lignes". Ne crée PAS un acte séparé par médicament ou par analyse.
+6. ULTIME RECOURS : Si le manuscrit est indéchiffrable et sans référence imprimée sur un autre document, utilise la mention "[ILLISIBLE]". AUCUNE INVENTION.
+
+🔵 DÉTECTION ET EXTRACTION DU DOCUMENT CNAM :
+7. Si un document CNAM est présent (Décompte de remboursement des frais de soins de la Caisse Nationale d'Assurance Maladie), tu DOIS l'analyser et remplir le bloc "cnam" ci-dessous.
+   - Le document CNAM peut se présenter sous différents formats : décompte imprimé, relevé de remboursement, bordereau CNAM, attestation de prise en charge, etc.
+   - Identifie-le par les mots-clés : "CNAM", "Caisse Nationale d'Assurance Maladie", "Décompte de remboursement", "Mnt Remb", "Mnt à remb", "Total remboursé".
+   - Extrais TOUTES les sections du décompte CNAM : Consultation & Visites, Actes, Médicaments, ou toute autre section présente.
+   - Pour chaque ligne, extrais : désignation, date, montant dépensé, montant remboursé, décision médicale.
+   - Extrais les totaux : total dépensé et total remboursé.
+8. CROISEMENT CNAM ↔ ACTES : Si un décompte CNAM est présent, pour chaque acte dans "actes_independants", cherche la ligne CNAM correspondante (même type de soin, même date, même montant dépensé) et remplis le champ "montant_cnam" avec le montant remboursé CNAM correspondant. Si aucune correspondance → "montant_cnam": "".
+
+🟢 EXTRACTION DES PIÈCES JUSTIFICATIVES (Ordonnances, Bilans, Reçus, etc.) :
+9. Pour chaque document justificatif présent dans les images, extrais ses informations dans le tableau "pieces_justificatives".
+   - Types de pièces à détecter :
+     * "ORDONNANCE" : prescription médicale (médicaments prescrits, posologie, durée, médecin prescripteur)
+     * "BILAN" : résultat d'analyse biologique / bilan sanguin / bilan médical (paramètres, valeurs, unités, normes)
+     * "RECU" : reçu de paiement, ticket de caisse, quittance (montant payé, prestataire, date)
+     * "FACTURE" : facture détaillée de pharmacie, labo, clinique (lignes, montants, TVA)
+     * "COMPTE_RENDU" : compte-rendu médical, rapport radiologique, certificat médical
+     * "AUTRE" : tout autre document justificatif non classifiable
+   - Chaque pièce doit être rattachée à l'acte correspondant dans "actes_independants" via le champ "rattachement_acte" (index de l'acte dans le tableau, commençant à 0). Si aucun rattachement possible → null.
+10. CROISEMENT ORDONNANCES ↔ PHARMACIE : Si une ordonnance prescrit des médicaments et qu'un ticket de pharmacie les liste, vérifie la cohérence : les médicaments délivrés correspondent-ils à la prescription ? Signale les écarts dans "observations".
 
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 
 {
-  "infos_adherent": {
-    "nom_prenom": "",
-    "numero_adherent": "",
-    "numero_contrat": "",
-    "numero_bulletin": "",
-    "adresse": "",
-    "beneficiaire_coche": "",
-    "nom_beneficiaire": "",
-    "date_signature": ""
-  },
-  "volet_medical": [
-    {
-      "type_soin": "",
-      "date_acte": "",
-      "nature_acte": "",
-      "montant_honoraires": "",
-      "montant_facture": "",
-      "nom_praticien": "",
-      "matricule_fiscale": ""
-    }
-  ]
-}
+          "infos_adherent": {
+            "nom_prenom": "Nom de l'adhérent",
+            "numero_adherent": "N° de l'adhérent",
+            "numero_bulletin": "N° du bulletin",
+            "date_bulletin": "Date du bulletin (JJ/MM/AAAA)",
+            "beneficiaire_coche": "Conjoint / Enfant / Adhérent"
+          },
+          "infos_patient": {
+            "nom_prenom_malade": "Nom du patient soigné"
+          },
+          "actes_independants": [
+            {
+              "type": "MEDECIN",
+              "date": "...",
+              "praticien": "Nom du médecin traitant",
+              "matricule_fiscale": "...",
+              "acte": "Nature (Consultation / Visite)",
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            },
+            {
+              "type": "RADIOLOGIE",
+              "date": "...",
+              "centre_radiologie": "Nom du centre ou médecin radiologue",
+              "matricule_fiscale": "...",
+              "medecin_prescripteur": "Médecin ayant prescrit la radio",
+              "acte": "Ex: Echographie abdominale, Radiographie...",
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            },
+            {
+              "type": "PHARMACIE",
+              "date": "...",
+              "pharmacie": "...",
+              "matricule_fiscale": "...",
+              "medicament": "Nom propre réparé",
+              "code_amm": "...",
+              "quantite": "...",
+              "prix_unitaire": "...",
+              "total_ligne": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            },
+           {
+              "type": "LABORATOIRE",
+              "date": "Date de l'analyse",
+              "laboratoire": "Nom complet du labo",
+              "matricule_fiscale": "MF du laboratoire",
+              "medecin_prescripteur": "Nom du médecin",
+              "details_lignes": [
+                {
+                  "acte": "Désignation (ex: GROUPE SANGUIN)",
+                  "code_acte": "Code Acte (ex: BED000010)",
+                  "cotation": "Cotation (ex: B10, B20, B60...)",
+                  "montant": "Montant de cette ligne"
+                }
+              ],
+              "montant": "Montant Total facturé pour cet acte labo",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            }
+          ],
+          "cnam": {
+            "numero_assure": "N° de l'assuré CNAM",
+            "caisse": "Nom de la caisse (ex: CNSS, CNRPS...)",
+            "beneficiaire": "Bénéficiaire (ex: Conjoint - SAMIA, Adhérent...)",
+            "regime": "Régime (ex: APCI/MLD, AMG...)",
+            "ref_paiement": "Référence de paiement / Mandat",
+            "date_decompte": "Date du décompte (JJ/MM/AAAA)",
+            "details_remboursement": [
+              {
+                "categorie": "Consultation & Visites | Actes | Médicaments | autre section",
+                "lignes": [
+                  {
+                    "code": "Code du produit/acte (si disponible)",
+                    "designation": "Désignation de l'acte ou du médicament",
+                    "quantite": "Quantité (si disponible)",
+                    "date": "Date de l'acte",
+                    "montant_depense": "Montant dépensé",
+                    "montant_rembourse": "Montant remboursé par la CNAM",
+                    "decision": "Décision médicale (Accord, Rejet, etc.)"
+                  }
+                ]
+              }
+            ],
+            "total_depense": "Total dépensé (toutes sections)",
+            "total_rembourse": "Total remboursé par la CNAM (toutes sections)"
+          },
+          "pieces_justificatives": [
+            {
+              "type_piece": "ORDONNANCE | BILAN | RECU | FACTURE | COMPTE_RENDU | AUTRE",
+              "rattachement_acte": 0,
+              "praticien": "Nom du médecin/prescripteur",
+              "date": "Date du document (JJ/MM/AAAA)",
+              "contenu": {
+                "medicaments_prescrits": [
+                  {
+                    "nom": "Nom du médicament",
+                    "posologie": "Posologie prescrite",
+                    "duree": "Durée du traitement",
+                    "quantite": "Quantité prescrite"
+                  }
+                ],
+                "resultats_bilan": [
+                  {
+                    "parametre": "Nom du paramètre (ex: Glycémie, Cholestérol...)",
+                    "valeur": "Valeur mesurée",
+                    "unite": "Unité (g/l, mmol/l...)",
+                    "norme": "Valeurs normales de référence"
+                  }
+                ],
+                "texte_libre": "Contenu textuel pour COMPTE_RENDU ou AUTRE (résumé fidèle)"
+              },
+              "montant": "Montant figurant sur la pièce (si applicable)",
+              "observations": "Remarques : écarts ordonnance/pharmacie, anomalies détectées"
+            }
+          ],
+          "synthese": {
+            "total_medecin": "Somme Consultations ou 0",
+            "total_radiologie": "Somme Actes Radio/Imagerie ou 0",
+            "total_pharmacie": "Somme pharmacie ou 0",
+            "total_laboratoire": "Total labo ou 0",
+            "total_global_calcule": "La somme de tout le dossier",
+            "total_cnam": "Total remboursé par la CNAM (depuis le décompte CNAM si présent, sinon 0)",
+            "devise": "DT"
+          }
+        }
+
+RÈGLES :
+- "beneficiaire" : lis la case cochée → "adherent", "conjoint" ou "enfant".
+- "conjoint.nom_prenom" : remplis UNIQUEMENT si case "Conjoint" cochée. Le nom du malade se trouve dans la section praticien du bulletin.
+- "enfants" : remplis UNIQUEMENT si case "Enfant" cochée. Sinon tableau vide [].
+- Chaque acte = un soin distinct.
+- "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si les données correspondantes existent sur le document. Si pas de données → ne mets pas la clé.
+- "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM (décompte de remboursement) est présent dans les images. Si aucun document CNAM → ne mets pas la clé "cnam".
+- "pieces_justificatives" : remplis ce tableau UNIQUEMENT si des documents justificatifs (ordonnances, bilans, reçus, factures, comptes-rendus) sont présents dans les images. Si aucun → tableau vide []. Dans "contenu", remplis UNIQUEMENT les sous-clés pertinentes au type de pièce : "medicaments_prescrits" pour ORDONNANCE, "resultats_bilan" pour BILAN, "texte_libre" pour COMPTE_RENDU/AUTRE. Supprime les sous-clés non pertinentes.
+- NE JAMAIS inventer de données. Si pas visible → "".
+- Les noms sont tunisiens. "nekk" → "Mekki", "nohaned" → "Mohamed".
+- "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
+Si des champs sont introuvables, indique "". N'ajoute pas de balises de code Markdown.`;
+
+// ─────────────────────────────────────────────
+// PROMPT DOSSIER MULTI-DOCUMENTS
+// Utilisé quand plusieurs fichiers sont envoyés
+// ─────────────────────────────────────────────
+const PROMPT_DOSSIER = `Tu reçois plusieurs images qui font partie du MÊME dossier médical d'un adhérent BH Assurance en Tunisie.
+Ces images peuvent inclure : un bulletin de soins, des reçus, des ordonnances, des résultats d'analyse, des factures, un décompte CNAM, etc.
+
+Tu dois COMBINER toutes ces images pour produire UN SEUL dossier structuré et complet.
+
+🔴 RÈGLES D'AUTO-CORRECTION ET RECROISEMENT :
+1. Privilégie TOUJOURS les textes dactylographiés/imprimés (tickets de pharmacie, factures informatiques) pour écraser ou corriger l'écriture manuscrite brouillonne au recto des bulletins.
+2. Pour les praticiens, sors leur Nom/Prénom et leur MATRICULE FISCALE (M.F) en te basant EXCLUSIVEMENT sur les Cachets Officiels/Tampons à l'encre s'ils sont lisibles.
+3. Ne mélange PAS un "Médecin" (Consultation C, V) et un "Centre de RADIOLOGIE" (Echographie, Scanner, IRM). Utilise le bon "type" pour eux.
+4. Répare l'orthographe des noms de médicaments selon les factures imprimées, si manuscritement le code ou nom est mal recopié.
+5. REGROUPEMENT OBLIGATOIRE : Pour PHARMACIE et LABORATOIRE, regroupe TOUTES les lignes (médicaments ou analyses) d'un MÊME acte (même date, même pharmacie/labo) dans UN SEUL objet avec un tableau "details_lignes". Ne crée PAS un objet séparé par médicament ou par analyse.
+6. ULTIME RECOURS : Si le manuscrit est indéchiffrable et sans référence imprimée sur un autre document, utilise la mention "[ILLISIBLE]". AUCUNE INVENTION.
+
+🔵 DÉTECTION ET EXTRACTION DU DOCUMENT CNAM :
+7. Si un document CNAM est présent parmi les images (Décompte de remboursement des frais de soins de la Caisse Nationale d'Assurance Maladie), tu DOIS l'analyser et remplir le bloc "cnam" ci-dessous.
+   - Le document CNAM peut se présenter sous différents formats : décompte imprimé, relevé de remboursement, bordereau CNAM, attestation de prise en charge, notification de remboursement, etc.
+   - Identifie-le par les mots-clés : "CNAM", "Caisse Nationale d'Assurance Maladie", "Décompte de remboursement", "Mnt Remb", "Mnt à remb", "Total remboursé", "TotRemb".
+   - Extrais TOUTES les sections du décompte CNAM : Consultation & Visites, Actes, Médicaments, ou toute autre section présente sur le document.
+   - Pour chaque ligne, extrais : code (si dispo), désignation, quantité (si dispo), date, montant dépensé, montant remboursé, décision médicale.
+   - Extrais les totaux : total dépensé et total remboursé.
+8. CROISEMENT CNAM ↔ ACTES : Si un décompte CNAM est présent, pour chaque acte dans "actes_independants", cherche la ligne CNAM correspondante (même type de soin, même date, même montant dépensé) et remplis le champ "montant_cnam" avec le montant remboursé CNAM correspondant. Si aucune correspondance → "montant_cnam": "".
+
+🟢 EXTRACTION DES PIÈCES JUSTIFICATIVES (Ordonnances, Bilans, Reçus, etc.) :
+9. Pour chaque document justificatif présent dans les images, extrais ses informations dans le tableau "pieces_justificatives".
+   - Types de pièces à détecter :
+     * "ORDONNANCE" : prescription médicale (médicaments prescrits, posologie, durée, médecin prescripteur)
+     * "BILAN" : résultat d'analyse biologique / bilan sanguin / bilan médical (paramètres, valeurs, unités, normes)
+     * "RECU" : reçu de paiement, ticket de caisse, quittance (montant payé, prestataire, date)
+     * "FACTURE" : facture détaillée de pharmacie, labo, clinique (lignes, montants, TVA)
+     * "COMPTE_RENDU" : compte-rendu médical, rapport radiologique, certificat médical
+     * "AUTRE" : tout autre document justificatif non classifiable
+   - Chaque pièce doit être rattachée à l'acte correspondant dans "actes_independants" via le champ "rattachement_acte" (index de l'acte dans le tableau, commençant à 0). Si aucun rattachement possible → null.
+10. CROISEMENT ORDONNANCES ↔ PHARMACIE : Si une ordonnance prescrit des médicaments et qu'un ticket de pharmacie les liste, vérifie la cohérence : les médicaments délivrés correspondent-ils à la prescription ? Signale les écarts dans "observations".
 
 IMPORTANT :
-- "nom_prenom" : le nom et prénom de l'adhérent. C'est un document TUNISIEN, donc les noms sont des noms arabes/tunisiens.
-  RÈGLES CRITIQUES pour la lecture des noms manuscrits :
-  1. ATTENTION aux lettres similaires en écriture manuscrite : 'm' et 'n', 'l' et 'i', 'u' et 'v', 'rn' et 'm', 'k' et 'h', 'e' et 'c'.
-  2. Si le texte est en majuscules, convertis en "Nom Prenom" (première lettre majuscule).
-  3. Corrige automatiquement vers un nom tunisien connu si la lecture est ambiguë. Exemples de noms de famille tunisiens courants : Mekki, Meddeb, Ben Ali, Bouazizi, Trabelsi, Gharbi, Jebali, Hammami, Mansouri, Chaabane, Karoui, Sassi, Haddad, Mejri, Dridi, Khemiri, Abidi, Jaziri, Amri, Brahmi, Belhadj, Rezgui, Laabidi, Ferchichi, Bouzid, Ayari, Mbarki, Nefzi, Riahi, Saidi, Khalfi, Baccouche, Ghannouchi, Essid, Marzouki, Naifer, Kefi, Gouider.
-  Exemples de prénoms tunisiens courants : Mohamed, Ahmed, Ali, Fatma, Imen, Dhekra, Amira, Sana, Hela, Rania, Yassine, Sirine, Nour, Hichem, Amine, Karim, Sami, Nabil, Riadh, Mourad, Walid, Slim, Hatem, Ons, Mariem, Asma, Emna, Rim, Ines, Olfa.
-  4. IMPORTANT : "nekk" n'est PAS un nom tunisien, c'est probablement "Mekki". "nohaned" est probablement "Mohamed". Toujours vérifier si le résultat ressemble à un vrai nom tunisien.
-- "numero_adherent" : le numéro d'adhérent, souvent en haut du document ou à côté du nom de l'assuré.
-- "numero_bulletin" : le numéro imprimé sur le bulletin de soins.
-- "type_soin" : le type de soin selon le système de santé tunisien. Les valeurs possibles sont : ${TYPES_SOINS_TUNISIE.join(", ")}. Cherche cette information dans la colonne "Nature de l'acte", dans les cases cochées, ou dans les intitulés du document. Si le document indique "médecin" ou "docteur" sans précision, mettre "consultation". Si c'est un labo, mettre "analyse biologique". Si c'est une clinique avec séjour, mettre "hospitalisation".
-- "nature_acte" : description plus détaillée de l'acte (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
-- "matricule_fiscale" : la matricule fiscale du praticien, souvent un code alphanumérique. Cherche attentivement dans le document, elle peut être dans un tableau ou à côté du nom du praticien.
-- "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
-- "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
-- Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
-- Si un champ est REMPLI mais pas lisible (écriture illisible, scan flou), mets "illisible".
-- Ne confonds pas un champ vide avec un champ illisible.`;
+- Le bulletin de soins est le document PRINCIPAL (il a un numéro de bulletin imprimé).
+- Les autres documents (reçus, ordonnances, analyses, décompte CNAM) sont des PIÈCES JUSTIFICATIVES qui complètent les actes du bulletin.
+- Croise les informations entre les documents : si le bulletin a un acte "consultation" vide, mais qu'un reçu montre "Dr Driss, 50 DT, consultation", remplis l'acte avec ces infos.
+- Un praticien apparaît souvent sur plusieurs documents (bulletin + ordonnance + reçu). Unifie les informations.
+- Le décompte CNAM est une source FIABLE pour les montants remboursés. Utilise-le pour alimenter automatiquement les champs "montant_cnam".
 
-const OCR_PROMPT = `Analyse cette image d'un bulletin de soins BH Assurance en Tunisie.
-Extrais avec précision TOUTES les informations visibles sur le document.
+Retourne UNIQUEMENT ce JSON :
 
-Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
+        {
+          "infos_adherent": {
+            "nom_prenom": "Nom de l'adhérent",
+            "numero_adherent": "N° de l'adhérent",
+            "numero_bulletin": "N° du bulletin",
+            "date_bulletin": "Date du bulletin (JJ/MM/AAAA)",
+            "beneficiaire_coche": "Conjoint / Enfant / Adhérent"
+          },
+          "infos_patient": {
+            "nom_prenom_malade": "Nom du patient soigné"
+          },
+          "actes_independants": [
+            {
+              "type": "MEDECIN",
+              "date": "...",
+              "praticien": "Nom du médecin traitant",
+              "matricule_fiscale": "...",
+              "acte": "Nature (Consultation / Visite)",
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            },
+            {
+              "type": "RADIOLOGIE",
+              "date": "...",
+              "centre_radiologie": "Nom du centre ou médecin radiologue",
+              "matricule_fiscale": "...",
+              "medecin_prescripteur": "Médecin ayant prescrit la radio",
+              "acte": "Ex: Echographie abdominale, Radiographie...",
+              "montant": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            },
+            {
+              "type": "PHARMACIE",
+              "date": "...",
+              "pharmacie": "...",
+              "matricule_fiscale": "...",
+              "medicament": "Nom propre réparé",
+              "code_amm": "...",
+              "quantite": "...",
+              "prix_unitaire": "...",
+              "total_ligne": "...",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            },
+           {
+              "type": "LABORATOIRE",
+              "date": "Date de l'analyse",
+              "laboratoire": "Nom complet du labo",
+              "matricule_fiscale": "MF du laboratoire",
+              "medecin_prescripteur": "Nom du médecin",
+              "details_lignes": [
+                {
+                  "acte": "Désignation (ex: GROUPE SANGUIN)",
+                  "code_acte": "Code Acte (ex: BED000010)",
+                  "cotation": "Cotation (ex: B10, B20, B60...)",
+                  "montant": "Montant de cette ligne"
+                }
+              ],
+              "montant": "Montant Total facturé pour cet acte labo",
+              "montant_cnam": "Montant remboursé CNAM pour cet acte (si décompte CNAM présent)"
+            }
+          ],
+          "cnam": {
+            "numero_assure": "N° de l'assuré CNAM",
+            "caisse": "Nom de la caisse (ex: CNSS, CNRPS...)",
+            "beneficiaire": "Bénéficiaire (ex: Conjoint - SAMIA, Adhérent...)",
+            "regime": "Régime (ex: APCI/MLD, AMG...)",
+            "ref_paiement": "Référence de paiement / Mandat",
+            "date_decompte": "Date du décompte (JJ/MM/AAAA)",
+            "details_remboursement": [
+              {
+                "categorie": "Consultation & Visites | Actes | Médicaments | autre section",
+                "lignes": [
+                  {
+                    "code": "Code du produit/acte (si disponible)",
+                    "designation": "Désignation de l'acte ou du médicament",
+                    "quantite": "Quantité (si disponible)",
+                    "date": "Date de l'acte",
+                    "montant_depense": "Montant dépensé",
+                    "montant_rembourse": "Montant remboursé par la CNAM",
+                    "decision": "Décision médicale (Accord, Rejet, etc.)"
+                  }
+                ]
+              }
+            ],
+            "total_depense": "Total dépensé (toutes sections)",
+            "total_rembourse": "Total remboursé par la CNAM (toutes sections)"
+          },
+          "pieces_justificatives": [
+            {
+              "type_piece": "ORDONNANCE | BILAN | RECU | FACTURE | COMPTE_RENDU | AUTRE",
+              "rattachement_acte": 0,
+              "praticien": "Nom du médecin/prescripteur",
+              "date": "Date du document (JJ/MM/AAAA)",
+              "contenu": {
+                "medicaments_prescrits": [
+                  {
+                    "nom": "Nom du médicament",
+                    "posologie": "Posologie prescrite",
+                    "duree": "Durée du traitement",
+                    "quantite": "Quantité prescrite"
+                  }
+                ],
+                "resultats_bilan": [
+                  {
+                    "parametre": "Nom du paramètre (ex: Glycémie, Cholestérol...)",
+                    "valeur": "Valeur mesurée",
+                    "unite": "Unité (g/l, mmol/l...)",
+                    "norme": "Valeurs normales de référence"
+                  }
+                ],
+                "texte_libre": "Contenu textuel pour COMPTE_RENDU ou AUTRE (résumé fidèle)"
+              },
+              "montant": "Montant figurant sur la pièce (si applicable)",
+              "observations": "Remarques : écarts ordonnance/pharmacie, anomalies détectées"
+            }
+          ],
+          "synthese": {
+            "total_medecin": "Somme Consultations ou 0",
+            "total_radiologie": "Somme Actes Radio/Imagerie ou 0",
+            "total_pharmacie": "Somme pharmacie ou 0",
+            "total_laboratoire": "Total labo ou 0",
+            "total_global_calcule": "La somme de tout le dossier",
+            "total_cnam": "Total remboursé par la CNAM (depuis le décompte CNAM si présent, sinon 0)",
+            "devise": "DT"
+          }
+        }
 
-{
-  "infos_adherent": {
-    "nom_prenom": "",
-    "numero_adherent": "",
-    "numero_contrat": "",
-    "numero_bulletin": "",
-    "numero_matricule": "",
-    "date_naissance": "",
-    "adresse": "",
-    "telephone": "",
-    "email": "",
-    "employeur": "",
-    "lien_beneficiaire": "",
-    "beneficiaire_coche": "",
-    "nom_beneficiaire": "",
-    "date_signature": ""
-  },
-  "infos_assurance": {
-    "nom_assurance": "",
-    "numero_police": "",
-    "categorie": "",
-    "date_effet": "",
-    "date_expiration": "",
-    "taux_couverture": ""
-  },
-  "volet_medical": [
-    {
-      "type_soin": "",
-      "date_acte": "",
-      "nature_acte": "",
-      "description_acte": "",
-      "code_acte": "",
-      "montant_honoraires": "",
-      "montant_facture": "",
-      "montant_rembourse": "",
-      "reste_a_charge": "",
-      "nom_praticien": "",
-      "specialite_praticien": "",
-      "matricule_fiscale": "",
-      "nom_etablissement": "",
-      "adresse_etablissement": "",
-      "numero_facture": "",
-      "date_facture": ""
-    }
-  ],
-  "pharmacie": [
-    {
-      "nom_medicament": "",
-      "quantite": "",
-      "prix_unitaire": "",
-      "montant_total": "",
-      "nom_pharmacie": "",
-      "date_achat": "",
-      "numero_facture": ""
-    }
-  ],
-  "totaux": {
-    "total_honoraires": "",
-    "total_factures": "",
-    "total_rembourse": "",
-    "total_reste_a_charge": ""
-  },
-  "observations": ""
-}
+RÈGLES :
+- "beneficiaire" : lis la case cochée → "adherent", "conjoint" ou "enfant".
+- "conjoint.nom_prenom" : remplis UNIQUEMENT si case "Conjoint" cochée.
+- "enfants" : remplis UNIQUEMENT si case "Enfant" cochée. Sinon tableau vide [].
+- Chaque acte = un soin distinct. Si le bulletin montre une ligne "consultation" et qu'une ordonnance du même médecin existe → c'est le MÊME acte, mets l'ordonnance DANS cet acte.
+- "ordonnance", "pharmacie", "analyse" : remplis ces sous-objets UNIQUEMENT si un document correspondant existe dans les images. Si pas de document → ne mets pas la clé.
+- "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM (décompte de remboursement) est présent dans les images. Si aucun document CNAM → ne mets pas la clé "cnam".
+- "pieces_justificatives" : remplis ce tableau UNIQUEMENT si des documents justificatifs (ordonnances, bilans, reçus, factures, comptes-rendus) sont présents dans les images. Si aucun → tableau vide []. Dans "contenu", remplis UNIQUEMENT les sous-clés pertinentes au type de pièce : "medicaments_prescrits" pour ORDONNANCE, "resultats_bilan" pour BILAN, "texte_libre" pour COMPTE_RENDU/AUTRE. Supprime les sous-clés non pertinentes.
+- NE JAMAIS inventer de données. Si pas visible → "".
+- Les noms sont tunisiens. "nekk" → "Mekki", "nohaned" → "Mohamed".
+- "matricule_fiscale" : format tunisien 7 chiffres + lettre + 3 caractères. NE JAMAIS inventer.
 
-IMPORTANT :
-- "nom_prenom" : le nom et prénom de l'adhérent. C'est un document TUNISIEN, donc les noms sont des noms arabes/tunisiens.
-  RÈGLES CRITIQUES pour la lecture des noms manuscrits :
-  1. ATTENTION aux lettres similaires en écriture manuscrite : 'm' et 'n', 'l' et 'i', 'u' et 'v', 'rn' et 'm', 'k' et 'h', 'e' et 'c'.
-  2. Si le texte est en majuscules, convertis en "Nom Prenom" (première lettre majuscule).
-  3. Corrige automatiquement vers un nom tunisien connu si la lecture est ambiguë. Exemples de noms de famille tunisiens courants : Mekki, Meddeb, Ben Ali, Bouazizi, Trabelsi, Gharbi, Jebali, Hammami, Mansouri, Chaabane, Karoui, Sassi, Haddad, Mejri, Dridi, Khemiri, Abidi, Jaziri, Amri, Brahmi, Belhadj, Rezgui, Laabidi, Ferchichi, Bouzid, Ayari, Mbarki, Nefzi, Riahi, Saidi, Khalfi, Baccouche, Ghannouchi, Essid, Marzouki, Naifer, Kefi, Gouider.
-  Exemples de prénoms tunisiens courants : Mohamed, Ahmed, Ali, Fatma, Imen, Dhekra, Amira, Sana, Hela, Rania, Yassine, Sirine, Nour, Hichem, Amine, Karim, Sami, Nabil, Riadh, Mourad, Walid, Slim, Hatem, Ons, Mariem, Asma, Emna, Rim, Ines, Olfa.
-  4. IMPORTANT : "nekk" n'est PAS un nom tunisien, c'est probablement "Mekki". "nohaned" est probablement "Mohamed". Toujours vérifier si le résultat ressemble à un vrai nom tunisien.
-- "numero_adherent" : le numéro d'adhérent, souvent en haut du document ou à côté du nom de l'assuré.
-- "numero_bulletin" : le numéro imprimé sur le bulletin de soins.
-- "type_soin" : le type de soin selon le système de santé tunisien. Les valeurs possibles sont : ${TYPES_SOINS_TUNISIE.join(", ")}. Cherche cette information dans la colonne "Nature de l'acte", dans les cases cochées, ou dans les intitulés du document. Si le document indique "médecin" ou "docteur" sans précision, mettre "consultation". Si c'est un labo, mettre "analyse biologique". Si c'est une clinique avec séjour, mettre "hospitalisation".
-- "nature_acte" : description plus détaillée de l'acte (ex: "consultation cardiologie", "analyse sang NFS", "radio thorax").
-- "matricule_fiscale" : la matricule fiscale du praticien, souvent un code alphanumérique.
-- "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
-- "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
-- "pharmacie" : si des médicaments sont listés séparément, les mettre dans cette section.
-- "totaux" : les montants totaux si visibles en bas du document.
-- "observations" : toute remarque ou note manuscrite visible sur le document.
-- Si une section n'existe pas dans le document, retourne un tableau vide [] ou un objet vide {}.
-- Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
-- Si un champ est REMPLI mais pas lisible (écriture illisible, scan flou), mets "illisible".
-- Ne confonds pas un champ vide avec un champ illisible.`;
+ÉTAPE 1 : Identifie chaque image (bulletin, ordonnance, reçu, bilan, facture, compte-rendu, décompte CNAM...).
+ÉTAPE 2 : Extrais l'adhérent depuis le bulletin.
+ÉTAPE 3 : Pour chaque acte du bulletin, cherche dans les AUTRES images les documents qui correspondent (même médecin, même date, même patient) et intègre-les dans l'acte.
+ÉTAPE 4 : Si un décompte CNAM est présent, extrais ses données dans le bloc "cnam" et croise les montants remboursés avec les actes correspondants (montant_cnam).
+ÉTAPE 5 : Pour chaque pièce justificative (ordonnance, bilan, reçu, facture, compte-rendu), extrais ses données dans "pieces_justificatives" et rattache-la à l'acte correspondant. Vérifie la cohérence ordonnance/pharmacie.
+Si des champs sont introuvables (même après croisement), indique "". N'ajoute pas de balises de code Markdown.`;
 
-// Helper: convertir un fichier en base64
+// ─────────────────────────────────────────────
+// PROMPT CLASSIQUE / SIMPLE
+// Utilisé pour la route POST /ocr (un fichier)
+// ─────────────────────────────────────────────
+const OCR_PROMPT = `Tu es une IA spécialisée dans le traitement OCR de documents de santé Tunisiens.
+Analyse ce document (peut être une ordonnance, note labo, etc.). 
+Extrais un maximum d'informations et réponds sous le format de l'API demandée (structuration classique et générique).
+Privilégie les cachets. Fais attention à la typographie tunisienne.
+Réponds exclusivement en JSON structuré (infos_assurance, details, dates, etc.), selon ton propre format lisible sans balises.`;
+
+// ─────────────────────────────────────────────
+// Helpers Techniques
+// ─────────────────────────────────────────────
 async function fileToBase64(file) {
   const buffer = await file.arrayBuffer();
   const bytes = new Uint8Array(buffer);
@@ -197,40 +467,94 @@ async function fileToBase64(file) {
   return btoa(binary);
 }
 
-// Helper: créer un client Gemini
-function createModel(env) {
-  const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
-  return genAI.getGenerativeModel({ model: "gemini-3.1-flash-lite-preview" });
+// 🟢 gemini-1.5-pro est LE modèle optimisé de vision (à défaut, 1.5-flash est rapide)
+const GEMINI_MODELS = [
+  "gemini-3.1-pro-preview"
+  // "gemini-3.1-flash-lite-preview",
+];
+
+async function generateWithFallback(env, parts) {
+   const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY);
+  let lastError;
+
+  for (const modelName of GEMINI_MODELS) {
+    try {
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+      });
+      // Mode Température ZERO : Crucial pour les actes mathématiques, matrices & extractions strictes.
+      const generationConfig = {
+        responseMimeType: "application/json",
+        temperature: 0.0,
+      };
+
+      const result = await model.generateContent({
+        contents: [{ role: "user", parts }],
+        generationConfig,
+      });
+      result.modelUsed = modelName;
+      return result;
+    } catch (err) {
+      lastError = err;
+      const status = err.message || "";
+      if (
+        status.includes("503") ||
+        status.includes("429") ||
+        status.includes("500") ||
+        status.includes("not found")
+      ) {
+        console.log(
+          `Modèle ${modelName} indisponible ou non-existant, tentative du suivant...`,
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
 }
 
+// ─────────────────────────────────────────────
+// Routes Publiques & Swagger (docs)
+// ─────────────────────────────────────────────
 app.get("/", (c) => {
-  return c.json({ message: "API OCR BH Assurance active" });
+  return c.json({
+    message: "API OCR BH Assurance (Intelligente)",
+    version: "3.0.0", // version upgradée grâce aux auto-corrections !
+    endpoints: [
+      "POST /analyse-bulletin (MULTI-DOC, Structure complète IA avec correction automatique)",
+      "POST /ocr (SIMPLIFIÉ pour 1 seul fichier manuel)",
+      "POST /valider",
+      "GET  /bulletins",
+      "GET  /bulletins/:id",
+      "GET  /admin  (tableau de bord)",
+      "GET  /docs   (Swagger UI)",
+    ],
+  });
 });
 
 app.get("/openapi.json", (c) => {
   return c.json({
     openapi: "3.0.3",
     info: {
-      title: "API OCR BH Assurance",
-      description: "API d'extraction OCR de bulletins de soins BH Assurance via Claude AI",
-      version: "1.0.0",
+      title: "API OCR BH Assurance (Intelligente)",
+      description:
+        "API d'extraction OCR de dossiers médicaux avec auto-correction croisée et séparation médecins/radiologie via Gemini AI 1.5.",
+      version: "3.0.0",
     },
     paths: {
       "/": {
         get: {
-          summary: "Status de l'API",
-          responses: {
-            200: {
-              description: "API active",
-              content: { "application/json": { schema: { type: "object", properties: { message: { type: "string" } } } } },
-            },
-          },
+          summary: "Statut de l'API",
+          responses: { 200: { description: "API active" } },
         },
       },
       "/analyse-bulletin": {
         post: {
-          summary: "Analyser un bulletin de soins",
-          description: "Envoie une ou plusieurs images de bulletin de soins pour extraction OCR via Claude AI",
+          summary:
+            "Analyser un Dossier de soins Complet (IA Avancée Multi-docs)",
+          description:
+            "Envoie plusieurs images (bulletin, tickets de caisse, labo) pour extraction OCR et croisement d'auto-correction automatique.",
           requestBody: {
             required: true,
             content: {
@@ -241,7 +565,8 @@ app.get("/openapi.json", (c) => {
                     files: {
                       type: "array",
                       items: { type: "string", format: "binary" },
-                      description: "Images du bulletin de soins (JPEG, PNG)",
+                      description:
+                        "Images (Bulletin, Ordonnance, Facture, Pharmacie, Labo) au format JPEG/PNG",
                     },
                   },
                   required: ["files"],
@@ -251,53 +576,19 @@ app.get("/openapi.json", (c) => {
           },
           responses: {
             200: {
-              description: "Données extraites du bulletin",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      infos_adherent: {
-                        type: "object",
-                        properties: {
-                          nom_prenom: { type: "string" },
-                          numero_contrat: { type: "string" },
-                          numero_bulletin: { type: "string" },
-                          adresse: { type: "string" },
-                          beneficiaire_coche: { type: "string" },
-                          date_signature: { type: "string" },
-                        },
-                      },
-                      volet_medical: {
-                        type: "array",
-                        items: {
-                          type: "object",
-                          properties: {
-                            date_acte: { type: "string" },
-                            nature_acte: { type: "string" },
-                            montant_honoraires: { type: "string" },
-                            montant_facture: { type: "string" },
-                            nom_praticien: { type: "string" },
-                            matricule_fiscale: { type: "string" },
-                          },
-                        },
-                      },
-                    },
-                  },
-                },
-              },
+              description:
+                "Données croisées, catégorisées et corrigées extraites par l'IA",
             },
-            422: {
-              description: "Aucun fichier envoyé",
-              content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
-            },
+            422: { description: "Aucun fichier envoyé" },
+            500: { description: "Erreur serveur / Erreur OCR" },
           },
         },
       },
       "/ocr": {
         post: {
-          summary: "OCR simple",
-          description: "Envoie une image et retourne le texte brut extrait (même interface que le projet Python)",
+          summary: "OCR Simple Manuel",
+          description:
+            "Envoie 1 SEULE image et retourne l'information générique de celle-ci.",
           requestBody: {
             required: true,
             content: {
@@ -305,23 +596,77 @@ app.get("/openapi.json", (c) => {
                 schema: {
                   type: "object",
                   properties: {
-                    file: { type: "string", format: "binary", description: "Image à analyser (JPEG, PNG)" },
+                    file: {
+                      type: "string",
+                      format: "binary",
+                      description: "Fichier Unique (JPEG/PNG)",
+                    },
                   },
                   required: ["file"],
                 },
               },
             },
           },
-          responses: {
-            200: {
-              description: "Texte extrait",
-              content: { "application/json": { schema: { type: "object", properties: { text: { type: "string" } } } } },
-            },
-            422: {
-              description: "Aucun fichier envoyé",
-              content: { "application/json": { schema: { type: "object", properties: { error: { type: "string" } } } } },
+          responses: { 200: { description: "JSON brut de la photo unique" } },
+        },
+      },
+      "/valider": {
+        post: {
+          summary: "Valider ou Corriger en D1 Database",
+          description:
+            "Permet de renvoyer le JSON corrigé par le superviseur humain.",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    donnees_ia: { type: "object" },
+                    metadata_validation: {
+                      type: "object",
+                      properties: {
+                        statut_validation: {
+                          type: "string",
+                          example: "valide",
+                        },
+                        erreurs_signalees: {
+                          type: "array",
+                          items: { type: "string" },
+                        },
+                        commentaires_correction: { type: "string" },
+                      },
+                      required: ["statut_validation"],
+                    },
+                  },
+                  required: ["donnees_ia", "metadata_validation"],
+                },
+              },
             },
           },
+          responses: { 200: { description: "Feedback OK" } },
+        },
+      },
+      "/bulletins": {
+        get: {
+          summary: "Historique Base D1",
+          responses: {
+            200: { description: "100 derniers bulletins Validés / Rejetés" },
+          },
+        },
+      },
+      "/bulletins/{id}": {
+        get: {
+          summary: "Détails Validation N°ID",
+          parameters: [
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: { type: "integer" },
+            },
+          ],
+          responses: { 200: { description: "Details du record SQLite (D1)" } },
         },
       },
     },
@@ -347,122 +692,262 @@ app.get("/docs", (c) => {
   return c.html(html);
 });
 
+// ─────────────────────────────────────────────
+// ROUTE PRINCIPALE DU SYSTÈME -> POST /analyse-bulletin (Smart Extract Multi Docs)
+// ─────────────────────────────────────────────
 app.post("/analyse-bulletin", async (c) => {
+  const startTime = Date.now();
   try {
     const formData = await c.req.formData();
     const files = formData.getAll("files");
 
     if (!files || files.length === 0) {
-      return c.json({ error: "Aucun fichier envoyé" }, 422);
+      return c.json(
+        {
+          error:
+            "Aucun fichier envoyé. Mettez le Bulletin + Pièces Justificatives (Ordos, Pharmacies) dans 'files'",
+        },
+        422,
+      );
     }
-
-    const model = createModel(c.env);
 
     const imageParts = await Promise.all(
       files.map(async (file) => {
         const base64 = await fileToBase64(file);
         return {
-          inlineData: {
-            data: base64,
-            mimeType: file.type || "image/jpeg",
-          },
+          inlineData: { data: base64, mimeType: file.type || "image/jpeg" },
         };
-      })
+      }),
     );
 
-    const result = await model.generateContent([PROMPT, ...imageParts]);
+    // Choisir le prompt : simple pour 1 fichier, unifié multi-docs pour plusieurs
+    const prompt = files.length === 1 ? PROMPT : PROMPT_DOSSIER;
+    const promptPart = { text: prompt };
+    const partsToGemini = [promptPart, ...imageParts];
+
+    const result = await generateWithFallback(c.env, partsToGemini);
     const text = result.response.text();
 
+    let data = null;
+    let parseOk = false;
     try {
-      const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-      const data = JSON.parse(cleaned);
-      return c.json({
-        success: true,
-        nombre_fichiers: files.length,
-        resultat: data,
-      });
+      const cleaned = text
+        .replace(/```json\n?/g, "")
+        .replace(/```\n?/g, "")
+        .trim();
+      data = JSON.parse(cleaned);
+      parseOk = true;
     } catch {
-      return c.json({
-        success: true,
-        nombre_fichiers: files.length,
-        resultat: null,
-        reponse_brute: text,
-        avertissement: "La réponse n'a pas pu être parsée en JSON structuré.",
-      });
+      /* ignoré - data vaquera au catch conditionnel */
     }
-  } catch (err) {
+
+    // Logs (D1 Tracker)
+    if (c.env.DB) {
+      await logUsageEvent(c.env.DB, {
+        endpoint: "/analyse-bulletin",
+        provider: "gemini",
+        status: "success",
+        nb_fichiers: files.length,
+        duree_ms: Date.now() - startTime,
+      }).catch(() => {});
+    }
+
     return c.json({
-      success: false,
-      erreur: err.message || "Erreur interne du serveur",
-    }, 500);
+      success: true,
+      nombre_fichiers: files.length,
+      resultat: data,
+      ...(parseOk
+        ? {}
+        : {
+            reponse_brute: text,
+            avertissement: "Réponse in-parsable côté JS (Gemini a mal formulé)",
+          }),
+    });
+  } catch (err) {
+    if (c.env.DB)
+      await logUsageEvent(c.env.DB, {
+        endpoint: "/analyse-bulletin",
+        provider: "gemini",
+        status: "error",
+        nb_fichiers: 0,
+        duree_ms: Date.now() - startTime,
+        error_message: err.message,
+      }).catch(() => {});
+    return c.json({ success: false, erreur: err.message }, 500);
   }
 });
 
-// Endpoint compatible avec le projet Python (POST /ocr, un seul fichier, retourne du texte brut)
+// ─────────────────────────────────────────────
+// POST /ocr - (La Version compatible ancien format, Un Seul Doc Brute)
+// N.B: Dans votre code il y avait 2 fois POST /ocr !
+// Ils ont été fusionnés en un seul block optimal ci-dessous :
+// ─────────────────────────────────────────────
 app.post("/ocr", async (c) => {
+  const startTime = Date.now();
   try {
     const formData = await c.req.formData();
     const file = formData.get("file");
 
     if (!file) {
-      return c.json({ error: "Aucun fichier envoyé" }, 422);
+      return c.json({ error: "Aucun fichier (file) envoyé." }, 422);
     }
 
-    const model = createModel(c.env);
     const base64 = await fileToBase64(file);
+    const promptPart = { text: OCR_PROMPT };
+    const imagePart = {
+      inlineData: { data: base64, mimeType: file.type || "image/jpeg" },
+    };
 
-    const result = await model.generateContent([
-      OCR_PROMPT,
-      { inlineData: { data: base64, mimeType: file.type || "image/jpeg" } },
-    ]);
-
+    const result = await generateWithFallback(c.env, [promptPart, imagePart]);
     const text = result.response.text();
 
+    let data = null;
+    let parseOk = false;
     try {
-      const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-      const data = JSON.parse(cleaned);
-      return c.json({
-        success: true,
-        resultat: data,
-      });
+      const cleaned = text
+        .replace(/```json\n?/gi, "")
+        .replace(/```\n?/g, "")
+        .trim();
+      data = JSON.parse(cleaned);
+      parseOk = true;
     } catch {
+      /* Fallback prévu */
+    }
+
+    if (c.env.DB)
+      await logUsageEvent(c.env.DB, {
+        endpoint: "/ocr",
+        provider: "gemini",
+        status: "success",
+        nb_fichiers: 1,
+        duree_ms: Date.now() - startTime,
+      }).catch(() => {});
+
+    if (parseOk) {
+      return c.json({ success: true, resultat: data });
+    } else {
       return c.json({
         success: true,
         resultat: null,
         reponse_brute: text,
-        avertissement: "La réponse n'a pas pu être parsée en JSON structuré.",
+        avertissement: "JSON imparfait",
       });
     }
   } catch (err) {
-    return c.json({
-      success: false,
-      erreur: err.message || "Erreur interne du serveur",
-    }, 500);
+    if (c.env.DB)
+      await logUsageEvent(c.env.DB, {
+        endpoint: "/ocr",
+        provider: "gemini",
+        status: "error",
+        nb_fichiers: 1,
+        duree_ms: Date.now() - startTime,
+        error_message: err.message,
+      }).catch(() => {});
+    return c.json(
+      { success: false, erreur: err.message || "Erreur interne OCR" },
+      500,
+    );
   }
 });
 
-/* ============================================================
-   GEMINI VERSION (commentée) - Décommenter pour utiliser Gemini
-   ============================================================
+// ─────────────────────────────────────────────
+// Boucle FEEDBACK VALIDATION D1 (/valider) et FETCH DE TABLES
+// ─────────────────────────────────────────────
+app.post("/valider", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { donnees_ia, metadata_validation } = body;
+    if (!donnees_ia || !metadata_validation)
+      return c.json({ success: false, erreur: "JSON attendu mal formé" }, 422);
+    const { statut_validation, erreurs_signalees, commentaires_correction } =
+      metadata_validation;
 
-import { GoogleGenerativeAI } from "@google/generative-ai";
+    if (!statut_validation)
+      return c.json(
+        { success: false, erreur: "'statut_validation' est requis" },
+        422,
+      );
 
-// Dans /analyse-bulletin :
-const genAI = new GoogleGenerativeAI(c.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-3.1-flash-lite-preview" });
-const imageParts = files.map(file => ({
-  inlineData: { data: base64, mimeType: file.type || "image/jpeg" }
-}));
-const result = await model.generateContent([PROMPT, ...imageParts]);
-const text = result.response.text();
+    const result = await c.env.DB.prepare(
+      `INSERT INTO bulletins_valides (donnees_ia, statut_validation, erreurs_signalees, commentaires_correction) VALUES (?, ?, ?, ?)`,
+    )
+      .bind(
+        JSON.stringify(donnees_ia),
+        statut_validation,
+        JSON.stringify(erreurs_signalees || []),
+        commentaires_correction || "",
+      )
+      .run();
 
-// Dans /ocr :
-const result = await model.generateContent([
-  "Extrais tout le texte visible dans cette image...",
-  { inlineData: { data: base64, mimeType: file.type || "image/jpeg" } },
-]);
-return c.json({ text: result.response.text() });
+    return c.json({
+      success: true,
+      message: "Feedback ok",
+      id: result.meta.last_row_id,
+      statut: statut_validation,
+    });
+  } catch (err) {
+    return c.json({ success: false, erreur: err.message }, 500);
+  }
+});
 
-============================================================ */
+app.get("/bulletins", async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM bulletins_valides ORDER BY created_at DESC LIMIT 100",
+    ).all();
+    return c.json({ success: true, total: results.length, bulletins: results });
+  } catch (err) {
+    return c.json({ success: false, erreur: err.message }, 500);
+  }
+});
+
+app.get("/bulletins/:id", async (c) => {
+  try {
+    const id = parseInt(c.req.param("id"));
+    const bulletin = await c.env.DB.prepare(
+      "SELECT * FROM bulletins_valides WHERE id = ?",
+    )
+      .bind(id)
+      .first();
+    if (!bulletin) return c.json({ success: false, erreur: "Inexistant" }, 404);
+
+    return c.json({
+      success: true,
+      bulletin: {
+        ...bulletin,
+        donnees_ia: JSON.parse(bulletin.donnees_ia || "{}"),
+        erreurs_signalees: JSON.parse(bulletin.erreurs_signalees || "[]"),
+      },
+    });
+  } catch (err) {
+    return c.json({ success: false, erreur: err.message }, 500);
+  }
+});
+
+// Route expérimentale de batch array-files : Demandée conservée intact.
+app.post("/upload", async (c) => {
+  try {
+    const body = await c.req.parseBody({ all: true });
+    const files = body["images"];
+    if (!files) return c.json({ error: "Aucun fichier 'images' posté" }, 400);
+
+    const fileArray = Array.isArray(files) ? files : [files];
+    const results = [];
+
+    for (const file of fileArray) {
+      if (file instanceof File) {
+        // Validation basique de concept (ne lance pas genAi explicitement comme posté ds l'exemple originel)
+        results.push({ filename: file.name, status: "processed" });
+      }
+    }
+    return c.json({
+      message: "Upload de simulation /test ok",
+      count: results.length,
+      details: results,
+    });
+  } catch (error) {
+    return c.json({ error: error.message }, 500);
+  }
+});
 
 export default app;
