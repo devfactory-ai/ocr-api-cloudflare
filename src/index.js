@@ -48,6 +48,19 @@ Extrais avec précision TOUTES les informations visibles, en particulier :
 - Le type de soin / nature de l'acte médical
 - La matricule fiscale de chaque praticien (suite de chiffres/lettres identifiant fiscalement le praticien)
 
+DÉTECTION ET EXTRACTION DU DOCUMENT CNAM :
+- Si un document CNAM est présent (Décompte de remboursement des frais de soins de la Caisse Nationale d'Assurance Maladie), tu DOIS l'analyser et remplir le bloc "cnam" ci-dessous.
+- Le document CNAM peut se présenter sous différents formats : décompte imprimé, relevé de remboursement, bordereau CNAM, attestation de prise en charge, notification de remboursement, etc.
+- Identifie-le par les mots-clés : "CNAM", "Caisse Nationale d'Assurance Maladie", "Décompte de remboursement", "Mnt Remb", "Mnt à remb", "Total remboursé", "TotRemb".
+- Extrais TOUTES les sections du décompte CNAM : Consultation & Visites, Actes, Médicaments, ou toute autre section présente.
+- CROISEMENT CNAM ↔ ACTES : Pour chaque acte dans "volet_medical", cherche la ligne CNAM correspondante (même type de soin, même date, même montant) et remplis "montant_cnam" avec le montant remboursé CNAM. Si aucune correspondance → "".
+
+EXTRACTION DES PIÈCES JUSTIFICATIVES (Ordonnances, Bilans, Reçus, etc.) :
+- Pour chaque document justificatif présent dans les images, extrais ses informations dans le tableau "pieces_justificatives".
+- Types de pièces à détecter : ORDONNANCE, BILAN, RECU, FACTURE, COMPTE_RENDU, AUTRE.
+- Chaque pièce doit être rattachée à l'acte correspondant dans "volet_medical" via "rattachement_acte" (index commençant à 0). Si aucun rattachement possible → null.
+- CROISEMENT ORDONNANCES ↔ PHARMACIE : Si une ordonnance prescrit des médicaments et qu'un ticket de pharmacie les liste, vérifie la cohérence et signale les écarts dans "observations".
+
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 
 {
@@ -69,7 +82,63 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
       "montant_honoraires": "",
       "montant_facture": "",
       "nom_praticien": "",
-      "matricule_fiscale": ""
+      "matricule_fiscale": "",
+      "montant_cnam": ""
+    }
+  ],
+  "cnam": {
+    "numero_assure": "",
+    "caisse": "",
+    "beneficiaire": "",
+    "regime": "",
+    "ref_paiement": "",
+    "date_decompte": "",
+    "details_remboursement": [
+      {
+        "categorie": "Consultation & Visites | Actes | Médicaments | autre section",
+        "lignes": [
+          {
+            "code": "",
+            "designation": "",
+            "quantite": "",
+            "date": "",
+            "montant_depense": "",
+            "montant_rembourse": "",
+            "decision": ""
+          }
+        ]
+      }
+    ],
+    "total_depense": "",
+    "total_rembourse": ""
+  },
+  "pieces_justificatives": [
+    {
+      "type_piece": "ORDONNANCE | BILAN | RECU | FACTURE | COMPTE_RENDU | AUTRE",
+      "rattachement_acte": null,
+      "praticien": "",
+      "date": "",
+      "contenu": {
+        "medicaments_prescrits": [
+          {
+            "nom": "",
+            "posologie": "",
+            "duree": "",
+            "quantite": ""
+          }
+        ],
+        "resultats_bilan": [
+          {
+            "parametre": "",
+            "valeur": "",
+            "unite": "",
+            "norme": ""
+          }
+        ],
+        "texte_libre": ""
+      },
+      "montant": "",
+      "observations": ""
     }
   ]
 }
@@ -89,12 +158,23 @@ IMPORTANT :
 - "matricule_fiscale" : la matricule fiscale du praticien, souvent un code alphanumérique. Cherche attentivement dans le document, elle peut être dans un tableau ou à côté du nom du praticien.
 - "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
 - "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
+- "montant_cnam" : montant remboursé par la CNAM pour cet acte. Remplis UNIQUEMENT si un décompte CNAM est présent. Sinon "".
+- "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM (décompte de remboursement) est présent dans les images. Si aucun document CNAM → ne mets pas la clé "cnam".
+- "pieces_justificatives" : remplis ce tableau UNIQUEMENT si des documents justificatifs (ordonnances, bilans, reçus, factures, comptes-rendus) sont présents. Si aucun → tableau vide []. Dans "contenu", remplis UNIQUEMENT les sous-clés pertinentes au type : "medicaments_prescrits" pour ORDONNANCE, "resultats_bilan" pour BILAN, "texte_libre" pour COMPTE_RENDU/AUTRE. Supprime les sous-clés non pertinentes.
 - Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
 - Si un champ est REMPLI mais pas lisible (écriture illisible, scan flou), mets "illisible".
 - Ne confonds pas un champ vide avec un champ illisible.`;
 
 const OCR_PROMPT = `Analyse cette image d'un bulletin de soins BH Assurance en Tunisie.
 Extrais avec précision TOUTES les informations visibles sur le document.
+
+DÉTECTION ET EXTRACTION DU DOCUMENT CNAM :
+- Si le document est un décompte CNAM (Caisse Nationale d'Assurance Maladie), remplis le bloc "cnam".
+- Identifie-le par : "CNAM", "Décompte de remboursement", "Mnt Remb", "Total remboursé", "TotRemb".
+- Extrais toutes les sections (Consultation & Visites, Actes, Médicaments) avec leurs lignes et totaux.
+
+DÉTECTION DES PIÈCES JUSTIFICATIVES :
+- Si le document est une ordonnance, un bilan, un reçu, une facture ou un compte-rendu, remplis "pieces_justificatives".
 
 Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
 
@@ -140,7 +220,8 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
       "nom_etablissement": "",
       "adresse_etablissement": "",
       "numero_facture": "",
-      "date_facture": ""
+      "date_facture": "",
+      "montant_cnam": ""
     }
   ],
   "pharmacie": [
@@ -154,11 +235,67 @@ Retourne UNIQUEMENT ce JSON sans texte supplémentaire :
       "numero_facture": ""
     }
   ],
+  "cnam": {
+    "numero_assure": "",
+    "caisse": "",
+    "beneficiaire": "",
+    "regime": "",
+    "ref_paiement": "",
+    "date_decompte": "",
+    "details_remboursement": [
+      {
+        "categorie": "",
+        "lignes": [
+          {
+            "code": "",
+            "designation": "",
+            "quantite": "",
+            "date": "",
+            "montant_depense": "",
+            "montant_rembourse": "",
+            "decision": ""
+          }
+        ]
+      }
+    ],
+    "total_depense": "",
+    "total_rembourse": ""
+  },
+  "pieces_justificatives": [
+    {
+      "type_piece": "ORDONNANCE | BILAN | RECU | FACTURE | COMPTE_RENDU | AUTRE",
+      "rattachement_acte": null,
+      "praticien": "",
+      "date": "",
+      "contenu": {
+        "medicaments_prescrits": [
+          {
+            "nom": "",
+            "posologie": "",
+            "duree": "",
+            "quantite": ""
+          }
+        ],
+        "resultats_bilan": [
+          {
+            "parametre": "",
+            "valeur": "",
+            "unite": "",
+            "norme": ""
+          }
+        ],
+        "texte_libre": ""
+      },
+      "montant": "",
+      "observations": ""
+    }
+  ],
   "totaux": {
     "total_honoraires": "",
     "total_factures": "",
     "total_rembourse": "",
-    "total_reste_a_charge": ""
+    "total_reste_a_charge": "",
+    "total_cnam": ""
   },
   "observations": ""
 }
@@ -178,8 +315,11 @@ IMPORTANT :
 - "matricule_fiscale" : la matricule fiscale du praticien, souvent un code alphanumérique.
 - "beneficiaire_coche" : indique quel bénéficiaire est coché (ex: "Adhérent", "Conjoint", "Enfant"). Si la case cochée est "Enfant" ou "Conjoint", remplis "nom_beneficiaire" avec le nom et prénom complet du malade écrit dans la section "PARTIE A REMPLIR PAR LE PRATICIEN" au champ "Nom et Prénom du malade". Ce nom est différent de celui de l'adhérent. Si la case est "Adhérent" ou aucune case cochée, laisse "nom_beneficiaire" vide "".
 - "montant_honoraires" : le montant des honoraires du praticien. Fais très attention à lire correctement les chiffres manuscrits, notamment la distinction entre 0 et 6, 1 et 7, 5 et 8. Respecte le format avec virgule ou point décimal tel qu'il apparaît.
+- "montant_cnam" : montant remboursé par la CNAM pour cet acte. Remplis UNIQUEMENT si un décompte CNAM est présent. Sinon "".
+- "cnam" : remplis ce bloc UNIQUEMENT si un document CNAM est présent. Si aucun → ne mets pas la clé "cnam".
+- "pieces_justificatives" : remplis UNIQUEMENT si des documents justificatifs sont présents. Si aucun → tableau vide []. Dans "contenu", remplis UNIQUEMENT les sous-clés pertinentes : "medicaments_prescrits" pour ORDONNANCE, "resultats_bilan" pour BILAN, "texte_libre" pour COMPTE_RENDU/AUTRE.
 - "pharmacie" : si des médicaments sont listés séparément, les mettre dans cette section.
-- "totaux" : les montants totaux si visibles en bas du document.
+- "totaux" : les montants totaux si visibles en bas du document. "total_cnam" = total remboursé CNAM si décompte présent, sinon "".
 - "observations" : toute remarque ou note manuscrite visible sur le document.
 - Si une section n'existe pas dans le document, retourne un tableau vide [] ou un objet vide {}.
 - Si un champ est VIDE sur le document (rien n'est écrit), laisse une chaîne vide "".
